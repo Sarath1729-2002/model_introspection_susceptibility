@@ -1,0 +1,11 @@
+[project]
+name = "susc"
+version = "0.1.0"
+description = "Probing and monitoring hint-adoption (sycophancy susceptibility) in an instruction-tuned LLM"
+requires-python = ">=3.10"
+dependencies = ["torch", "transformers", "accelerate", "datasets", "numpy", "pandas", "matplotlib"]
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+[tool.setuptools.packages.find]
+where = ["src"]
