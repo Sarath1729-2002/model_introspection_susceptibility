@@ -11,6 +11,8 @@ def enc(tok, text: str) -> List[int]:
 def load_model(model_id: str, dtype=torch.bfloat16):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(model_id)
+    if torch.cuda.is_available():
+        torch.backends.cuda.enable_cudnn_sdp(False)     # cuDNN attention needs memory outside PyTorch's allocator and crashed a shard near 80 GB; flash/mem-efficient SDPA do not
     try:
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype)
     except TypeError:                                   # older transformers
@@ -56,7 +58,10 @@ def generate(model, tok, prompts: List[str], n: int, max_new: int, temperature: 
             for r, j in enumerate(idx):
                 out[j] = [tok.decode(new[r * n + k].tolist(), skip_special_tokens=True) for k in range(n)]
             i += len(idx)
-        except torch.cuda.OutOfMemoryError:
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+            msg = str(exc).lower()
+            if not isinstance(exc, torch.cuda.OutOfMemoryError) and not any(k in msg for k in ("out of memory", "cudnn", "cuda error")):
+                raise
             torch.cuda.empty_cache()
             if bs == 1:
                 raise

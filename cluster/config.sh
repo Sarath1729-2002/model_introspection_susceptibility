@@ -21,6 +21,8 @@ export MAX_SEQS="${MAX_SEQS:-192}"             # sequences per generate() call p
 export FWD_BS="${FWD_BS:-8}"
 export SAMPLE_BUDGET_H="${SAMPLE_BUDGET_H:-8.5}"   # the sampling job stops starting new chunks after this many hours and exits cleanly (datasets are interleaved,
                                                    # so a cut-short run still covers every dataset); resubmit MODE=resume to continue
+export RESCUE_SHARD="${RESCUE_SHARD:-}"      # MODE=rescue: finish ONE crashed shard's leftover chunks using all GPUs
+export ORIG_NSHARDS="${ORIG_NSHARDS:-4}"
 export GATE_LIMIT="${GATE_LIMIT:-64}"          # problems per dataset in MODE=gate
 
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}" TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"

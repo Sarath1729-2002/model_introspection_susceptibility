@@ -4,6 +4,7 @@
 #   MODE=full    bash cluster/submit.sh   # the study: states -> sample -> trace -> analyze -> report, chained (afterok).  Resubmitting is safe: finished chunks are skipped.
 #   MODE=resume  bash cluster/submit.sh   # continue after the sampling time budget cut the run short (sample -> trace -> analyze -> report)
 #   MODE=part    bash cluster/submit.sh   # states + sample only, for DATASETS=... (use on a second node; then MODE=resume does trace -> analyze -> report for everything)
+#   MODE=rescue  RESCUE_SHARD=2 bash cluster/submit.sh   # a shard crashed: finish ITS leftover chunks on all 4 GPUs, then trace -> analyze -> report
 #   MODE=analyze bash cluster/submit.sh   # re-run analysis + report on what exists
 #   MODE=report  bash cluster/submit.sh   # just rebuild REPORT.md from the analysis pickles
 set -euo pipefail
@@ -30,6 +31,10 @@ full)
 part)
   st=$(sub states 03:00:00 "" "${NODE[@]}"); sa=$(sub sample "$SAMPLE_T" "$st" "${NODE[@]}"); tr="-"; an="-"; rp="-" ;;
 resume)
+  sa=$(sub sample "$SAMPLE_T" "" "${NODE[@]}"); tr=$(sub trace 02:00:00 "$sa" "${NODE[@]}")
+  an=$(sub analyze 04:00:00 "$tr" "${NODE[@]}"); rp=$(sub report 00:30:00 "$an" "${NODE[@]}"); st="-" ;;
+rescue)
+  [[ -n "${RESCUE_SHARD:-}" ]] || { echo "set RESCUE_SHARD=<crashed shard number>"; exit 1; }
   sa=$(sub sample "$SAMPLE_T" "" "${NODE[@]}"); tr=$(sub trace 02:00:00 "$sa" "${NODE[@]}")
   an=$(sub analyze 04:00:00 "$tr" "${NODE[@]}"); rp=$(sub report 00:30:00 "$an" "${NODE[@]}"); st="-" ;;
 analyze)

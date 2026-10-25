@@ -36,14 +36,14 @@ def positions_for(pr_len: int, comp_ids, text: str, tok):
     return pos
 
 
-def run(problems, model, tok, out_dir: Path, shard=0, nshards=1, conds=TRACE_CONDS, fwd_bs=4, chunk=64, tag="", budget_s=0, log=print) -> int:
+def run(problems, model, tok, out_dir: Path, shard=0, nshards=1, conds=TRACE_CONDS, fwd_bs=4, chunk=64, tag="", budget_s=0, sub="", log=print) -> int:
     out_dir = Path(out_dir)
     d = out_dir / "trace"
     d.mkdir(parents=True, exist_ok=True)
     pad = pad_id(tok)
     bud = Budget(budget_s)
     done = 0
-    for ds, k, batch in schedule(problems, shard, nshards, chunk):
+    for ds, k, batch in schedule(problems, shard, nshards, chunk, sub):
         f = d / f"t{shard:02d}_{ds}_{k:04d}{tag}.npz"
         sfile = out_dir / "samples" / f"s{shard:02d}_{ds}_{k:04d}{tag}.jsonl"
         if f.exists() or not sfile.exists():

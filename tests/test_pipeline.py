@@ -93,6 +93,14 @@ def test_download_failure_is_survivable(tmp_path):
     assert {p["ds"] for p in problems} == {"arith"} and [r["dataset"] for r in reports] == ["arith"]
 
 
+def test_rescue_split_partitions_a_shard(run):
+    from susc.sched import schedule
+    _, problems = run
+    full = [(d, k) for d, k, _ in schedule(problems, 1, 2, 30)]
+    parts = [[(d, k) for d, k, _ in schedule(problems, 1, 2, 30, f"{w}/3")] for w in range(3)]
+    assert sorted(sum(parts, [])) == sorted(full) and len({x for p in parts for x in p}) == len(full)
+
+
 def test_prompts():
     p = {"question": "Q?", "kind": "int", "gold": "5", "hint": "7"}
     assert "7" in user_text(p, "auth") and "5" not in user_text(p, "auth").split("Please")[0].replace("Q?", "")

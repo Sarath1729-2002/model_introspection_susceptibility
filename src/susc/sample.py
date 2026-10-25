@@ -21,13 +21,13 @@ def answer_entropy(answers: List) -> float:
 
 
 def run(problems, model, tok, out_dir: Path, shard=0, nshards=1, conds=CONDS, n=8, max_new: int = 0, temperature=0.7, top_p=0.95,
-        chunk=64, max_seqs=192, tag="", budget_s=0, log=print) -> int:
+        chunk=64, max_seqs=192, tag="", budget_s=0, sub="", log=print) -> int:
     d = Path(out_dir) / "samples"
     d.mkdir(parents=True, exist_ok=True)
     bud = Budget(budget_s)
     torch.manual_seed(1234 + 17 * shard)                  # reproducible per shard up to batching nondeterminism
     done = 0
-    for ds, k, batch in schedule(problems, shard, nshards, chunk):
+    for ds, k, batch in schedule(problems, shard, nshards, chunk, sub):
         f = d / f"s{shard:02d}_{ds}_{k:04d}{tag}.jsonl"
         if f.exists():
             continue

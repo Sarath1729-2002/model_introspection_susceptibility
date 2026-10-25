@@ -42,6 +42,7 @@ def main(argv=None):
     ap.add_argument("--conds", default="")
     ap.add_argument("--tag", default="")
     ap.add_argument("--budget-s", type=float, default=0, help="stop starting new chunks after this many seconds (clean exit; resumable)")
+    ap.add_argument("--sub", default="", help="w/W: take every W-th chunk of this shard (rescue mode)")
     ap.add_argument("--block", default="A", help="analysis block: A, B1, B2, CDE, T, tables")
     ap.add_argument("--sizes", default="", help='JSON, e.g. {"gsm8k":2400,"math":1800,"arc":1500,"arith":1000,"prog":1000}')
     a = ap.parse_args(argv)
@@ -76,14 +77,14 @@ def main(argv=None):
     if a.cmd == "sample":
         from . import sample
         sample.run(problems, model, tok, run, a.shard, a.nshards, conds=_csv(a.conds) or CONDS, n=a.n, max_new=a.max_new, temperature=a.temperature,
-                   top_p=a.top_p, chunk=a.chunk, max_seqs=a.max_seqs, tag=a.tag, budget_s=a.budget_s)
+                   top_p=a.top_p, chunk=a.chunk, max_seqs=a.max_seqs, tag=a.tag, budget_s=a.budget_s, sub=a.sub)
     elif a.cmd == "states":
         from . import states
-        states.run(problems, model, tok, run, a.shard, a.nshards, conds=_csv(a.conds) or CONDS, fwd_bs=a.fwd_bs, tag=a.tag, budget_s=a.budget_s)
+        states.run(problems, model, tok, run, a.shard, a.nshards, conds=_csv(a.conds) or CONDS, fwd_bs=a.fwd_bs, tag=a.tag, budget_s=a.budget_s, sub=a.sub)
     else:
         from . import trace
         trace.run(problems, model, tok, run, a.shard, a.nshards, conds=_csv(a.conds) or TRACE_CONDS, fwd_bs=max(1, a.fwd_bs // 2), chunk=a.chunk, tag=a.tag,
-                  budget_s=a.budget_s)
+                  budget_s=a.budget_s, sub=a.sub)
 
 
 if __name__ == "__main__":

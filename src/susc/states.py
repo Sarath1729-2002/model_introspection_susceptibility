@@ -13,14 +13,14 @@ from .prompts import CONDS, CUE, chat_prompt, user_text
 from .sched import Budget, schedule
 
 
-def run(problems, model, tok, out_dir: Path, shard=0, nshards=1, conds=CONDS, fwd_bs=8, chunk=128, tag="", budget_s=0, log=print) -> int:
+def run(problems, model, tok, out_dir: Path, shard=0, nshards=1, conds=CONDS, fwd_bs=8, chunk=128, tag="", budget_s=0, sub="", log=print) -> int:
     d = Path(out_dir) / "states"
     d.mkdir(parents=True, exist_ok=True)
     pad = pad_id(tok)
     cue_ids = enc(tok, CUE)
     bud = Budget(budget_s)
     done = 0
-    for ds, k, batch in schedule(problems, shard, nshards, chunk):
+    for ds, k, batch in schedule(problems, shard, nshards, chunk, sub):
         f = d / f"x{shard:02d}_{ds}_{k:04d}{tag}.npz"
         if f.exists():
             continue

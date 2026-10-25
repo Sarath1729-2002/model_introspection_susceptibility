@@ -28,7 +28,11 @@ run_sharded() {
   local n i rc=0 pids=()
   n="$(nvidia-smi -L | wc -l)"
   for ((i = 0; i < n; i++)); do
-    CUDA_VISIBLE_DEVICES=$i python -m susc.cli "$@" --shard "$i" --nshards "$n" &
+    if [[ -n "${RESCUE_SHARD:-}" && "${STAGE}" == "sample" ]]; then       # all GPUs work on the leftovers of the one crashed shard
+      CUDA_VISIBLE_DEVICES=$i python -m susc.cli "$@" --shard "$RESCUE_SHARD" --nshards "$ORIG_NSHARDS" --sub "$i/$n" &
+    else
+      CUDA_VISIBLE_DEVICES=$i python -m susc.cli "$@" --shard "$i" --nshards "$n" &
+    fi
     pids+=($!)
   done
   for p in "${pids[@]}"; do wait "$p" || rc=1; done
