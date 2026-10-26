@@ -1,51 +1,45 @@
-# model_introspection_susceptibility
+# model_introspection_probe_suite
 
-**Can we read, from a frozen LLM's hidden states, that it is about to defer to a wrong answer it was handed?**  Linear probes (regression labels only) and monitors for
-*hint adoption / sycophancy susceptibility* in Qwen2.5-7B-Instruct, on five problem sets whose ground truth is deterministic and audited. Probing and monitoring only - no steering
-(that is the next study; this one is designed to tell us whether it is worth doing and along which direction).
+Linear probes for what a frozen LLM's residual stream knows about its **own continuation**, in the quantities a monitor would act on:
+will it run away, how long, will it obey a constraint, is its answer already settled, how much is left. Every label is a deterministic function of greedy-decoded text
+(plus deterministic verifiers for the constraints), the baselines are explicit ladders, and the scorecard in `REPORT.md` applies pre-declared strict rules (`docs/PROTOCOL.md`).
 
-Read first: [`docs/PROTOCOL.md`](docs/PROTOCOL.md) (hypotheses and decision rules, declared before the run) and [`docs/MENTOR_BRIEF.md`](docs/MENTOR_BRIEF.md) (what this buys us and where it can go).
+Model: Qwen2.5-7B-Instruct. Data: GSM8K, MATH (integer answers), ARC (multiple choice), synthetic arithmetic, each passed through a ground-truth audit (admitted only at >= 99.5% pass).
+No model is trained: the only fitted objects are closed-form ridge probes.
 
-## What gets measured
-| stage | what | where |
-|---|---|---|
-| audit | every dataset must pass deterministic ground-truth checks (replayed GSM8K calculator annotations, single-boxed-integer MATH, re-executed synthetic code, ...) | `bench.py` |
-| behaviour | 7 prompt conditions per problem (`clean`, 4 wrong-hint framings, `placebo`, correct-hint), 8 sampled solutions each | `sample.py` |
-| states | last-prompt-token hidden state (all layers) + forced-answer log P(gold) / log P(wrong), per condition | `states.py` |
-| trace | hidden states at 5 points along one sampled solution (before it starts ... just before the final `\boxed`) | `trace.py` |
-| probes | A prospective (clean state -> susceptibility) · B in-context (hinted state -> will it follow) · C delta-state · D leave-one-framing-out · E geometry/specificity | `probes.py` |
-| causal-by-design | placebo/correct-hint contrasts, randomised hint offset/position, generator-set difficulty, belief->behaviour decomposition, difficulty-adjusted contrast, monitoring operating points | `causal.py` |
-| trace monitoring | probe vs text-so-far baselines along the solution, incl. *silent adoption* (hint value never written) | `monitor.py` |
-| report | `analysis/REPORT.md` + figures + CSVs, headline bullets generated from the numbers | `report.py` |
+## Stages (all resumable; one process per GPU; whole-node jobs)
+`setup.sh` (login node, once) -> `states` (prompt-end states for the plain and the constrained prompt) -> `gen` (greedy plain, greedy constrained, 4 sampled plain solutions)
+-> `trace` (hidden states + forced-answer log-probs at 6 checkpoints along the greedy plain solution) -> `analyze` (blocks P, C, K, tables, one per GPU) -> `report`.
 
-Datasets: GSM8K · MATH (integer-answer subset) · synthetic arithmetic chains · synthetic Python programs (tier A) · ARC-Challenge (tier B, expert key; analysed separately).
-Splits: iid (by problem) · difficulty shift (easy -> hard within each dataset) · leave-one-dataset-out.
-
-## Run on TamIA (account aip-oberman, whole nodes)
-```bash
-git pull                                   # on the cluster, never edit there
-bash cluster/setup.sh                      # LOGIN node, once: venv, model, GSM8K/MATH/ARC download, synthetic sets, ground-truth audit -> problems.jsonl
-MODE=gate bash cluster/submit.sh           # optional ~1h dry run on 48 problems/dataset  -> ${RUN_DIR}-gate/analysis/REPORT.md
-MODE=full bash cluster/submit.sh           # the study (chained with afterok): states -> sample -> trace -> analyze (4 GPUs in parallel) -> report
-MODE=resume bash cluster/submit.sh         # only if the sampling time budget cut the run short
-MODE=analyze bash cluster/submit.sh        # re-run analysis + report on whatever exists
+## Run it
 ```
-Timing (4xH100, one node): states ~1 h, sampling ~6-7 h (budget `SAMPLE_BUDGET_H=8.5`, then it stops cleanly; datasets are interleaved so a cut run still covers all of them),
-trace ~0.5 h, analysis ~1-1.5 h. Total ~9-10 h + queue. For a hard 12 h ceiling set `SAMPLE_BUDGET_H=7`.
-Knobs (env): `N_SAMPLES=8 SIZES='{"gsm8k":2400,"math":1800,"arc":1500,"arith":1000,"prog":1000}' DATASETS=gsm8k,math MODEL_ID=... SAMPLE_BUDGET_H=8.5`.
-Two nodes at once (optional): node 1 `DATASETS=gsm8k,arith,prog MODE=part bash cluster/submit.sh`, node 2 `DATASETS=math,arc MODE=part bash cluster/submit.sh` (states + sampling for those sets only; chunk files are
-dataset-keyed so they never collide), then once both finish `MODE=resume bash cluster/submit.sh` (sampling returns instantly, then trace -> analysis -> report on everything).
-Output: `$RUN_DIR/analysis/REPORT.md` (+ `fig*.png`, `*.csv`, `*.pkl`), `$RUN_DIR/ground_truth_audit.json`.
-Notifications: `SLACK_WEBHOOK_URL` / `NTFY_TOPIC` in `~/.bashrc` (see `cluster/config.sh`).
+bash cluster/setup.sh                       # once. Reuses ~/venvs/susc and the cached model if they exist. Refuses to rebuild an existing problem set.
+MODE=gate bash cluster/submit.sh            # optional dry run on 64 problems per dataset
+MODE=full bash cluster/submit.sh            # states -> gen -> trace -> analyze -> report, chained with --dependency=afterok
+```
+Recovery: `MODE=resume` (gen hit its time budget), `MODE=rescue RESCUE_SHARD=<n>` (one shard crashed: its leftover chunks run on all 4 GPUs, then trace -> analyze -> report), `MODE=analyze`, `MODE=report`.
+Never edit on the cluster and never pull while jobs run.
 
-## Tests
-`pytest tests` - tiny random Qwen2: prompt-end state equals a direct forward, resumability, time-budget stop, trace position 0 equals the pre-generation state, audit catches corrupted labels, leave-dataset-out really excludes the held-out set.
-`tests/test_signal.py` plants a known linear signal in fabricated states and checks the analysis **recovers it, passes against observable baselines, transfers across datasets, rises along the trace, and returns no PASS when the signal is removed.**
+## Look at the results
+```
+cat <RUN_DIR>/analysis/REPORT.md
+cat <RUN_DIR>/analysis/scorecard.csv
+```
+where `<RUN_DIR>` is `$SCRATCH/psuite/outputs/qwen7b-psuite`.
 
 ## Layout
-```
-src/susc/  bench prompts textutil | sample states trace sched hf_util | core ridge table | probes causal monitor | study report cli
-cluster/   config.sh setup.sh submit.sh run.sbatch
-docs/      PROTOCOL.md MENTOR_BRIEF.md
-tests/
-```
+`src/psuite`: `bench.py` (datasets + ground-truth audit), `verify.py` (constraints and their verifiers), `prompts.py`, `hf_util.py`, `gen.py`, `states.py`, `trace.py`, `table.py` (labels + baseline ladders),
+`probes.py`, `study.py`, `report.py`, `core.py`/`ridge.py` (probe machinery), `cli.py`. `tests/`: verifier tests, a tiny-model end-to-end test that checks the forced log-probs and the
+causality of the stored states against direct forwards, and planted-signal tests of the analysis (including a signal that does NOT generalise and must not be scored SUPPORTED).
+
+
+## Uncertainty POC (added)
+Linear probes for answer-distribution uncertainty (pass rate / answer entropy / majority share from rollouts, at the prompt end and after 48 / 96 tokens of the greedy solution), with split-half label reliability, positive controls and a decision rule written in advance.
+`docs/UNCERTAINTY_POC.md` has the design and the rule. Run after the main study: `MODE=unc bash cluster/submit.sh` (smoke: `UNC_N=40 MODE=unc ...`), read `$RUN_DIR/unc_n400/analysis/UNC_REPORT.md`.
+
+## Mega run (added)
+One overnight GSM8K-only job with four independent threads (causal step importance by intervention, uncertainty on 2000 unseen problems, steering test of the length direction, corrected re-analysis), corrected CV protocol and pre-registered rules: see `docs/MEGA.md`.
+`MODE=mega-smoke bash cluster/submit.sh` (dry run) then `MODE=mega bash cluster/submit.sh`; report: `$RUN_DIR/mega/analysis/MEGA_REPORT.md`.
+
+## Inject run (added)
+Error propagation at injection time (probe on the state at the last token of a number injected into the model's own chain of thought, vs the model's own surprise and the pre-edit state) + steering at large doses. Design and pre-registered rule: `docs/INJECT.md`. After the mega run: `MODE=inject-smoke` / `MODE=inject bash cluster/submit.sh`; report `$RUN_DIR/mega/inject/analysis/INJECT_REPORT.md`.

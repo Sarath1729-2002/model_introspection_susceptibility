@@ -1,28 +1,42 @@
 #!/bin/bash
-# All settings in one place; sourced by every script.  Override on the command line, e.g.  N_SAMPLES=12 MODE=full bash cluster/submit.sh
+# All settings in one place; sourced by every script.  Override on the command line, e.g.  GEN_BUDGET_H=3 MODE=full bash cluster/submit.sh
 export SLACK_EMAIL="${SLACK_EMAIL:-}"
 export SBATCH_ACCOUNT="${SBATCH_ACCOUNT:-aip-oberman}"
 export MODEL_ID="${MODEL_ID:-Qwen/Qwen2.5-7B-Instruct}"
-export RUN_NAME="${RUN_NAME:-qwen7b-susc}"
-export ROOT="${ROOT:-${SCRATCH:-$HOME/scratch}/susc}"
-export VENV="${VENV:-$HOME/venvs/susc}"
-export HF_HOME="${HF_HOME:-$ROOT/hf_home}"
+export RUN_NAME="${RUN_NAME:-qwen7b-psuite}"
+export ROOT="${ROOT:-${SCRATCH:-$HOME/scratch}/psuite}"
+export VENV="${VENV:-$HOME/venvs/susc}"                       # reuse the existing venv (torch etc. already installed); setup.sh adds this package to it
+if [[ -z "${HF_HOME:-}" ]]; then
+  if [[ -d "${SCRATCH:-/nonexistent}/susc/hf_home" ]]; then export HF_HOME="$SCRATCH/susc/hf_home"; else export HF_HOME="$ROOT/hf_home"; fi    # reuse the cached model
+fi
 export RUN_DIR="${RUN_DIR:-$ROOT/outputs/$RUN_NAME}"
 
-# ---- problem sets (all deterministic ground truth; see src/susc/bench.py for the audit that admits them) ----
-if [[ -z "${SIZES:-}" ]]; then SIZES='{"gsm8k":2400,"math":1800,"arc":1500,"arith":1000,"prog":1000}'; fi
+# ---- problem sets (all deterministic ground truth; src/psuite/bench.py audits them) ----
+if [[ -z "${SIZES:-}" ]]; then SIZES='{"gsm8k":2400,"math":1800,"arc":1200,"arith":1000}'; fi
 export SIZES
-export DATASETS="${DATASETS:-}"                # comma list to restrict a stage to some datasets (empty = all); lets two nodes work on different sets
-# ---- sampling ----
-export N_SAMPLES="${N_SAMPLES:-8}"             # sampled solutions per (problem, condition); behavioural label resolution is 1/N.  Forced-answer labels need no sampling.
-export TEMP="${TEMP:-0.7}" TOP_P="${TOP_P:-0.95}"
-export CHUNK="${CHUNK:-64}"                    # problems per resumable chunk file (the trace stage must use the same value)
-export MAX_SEQS="${MAX_SEQS:-192}"             # sequences per generate() call per GPU (H100 80GB)
-export FWD_BS="${FWD_BS:-8}"
-export SAMPLE_BUDGET_H="${SAMPLE_BUDGET_H:-8.5}"   # the sampling job stops starting new chunks after this many hours and exits cleanly (datasets are interleaved,
-                                                   # so a cut-short run still covers every dataset); resubmit MODE=resume to continue
-export RESCUE_SHARD="${RESCUE_SHARD:-}"      # MODE=rescue: finish ONE crashed shard's leftover chunks using all GPUs
+export DATASETS="${DATASETS:-}"                # comma list to restrict a stage to some datasets (empty = all)
+export N_SPREAD="${N_SPREAD:-4}"               # sampled plain solutions per problem (length spread / soft runaway rate); the labels themselves come from greedy decoding
+export CHUNK="${CHUNK:-64}"                    # problems per resumable chunk file (gen and trace must use the same value)
+export MAX_SEQS="${MAX_SEQS:-96}"              # sequences per generate() call per GPU (H100 80GB)
+export FWD_BS="${FWD_BS:-4}"
+export GEN_BUDGET_H="${GEN_BUDGET_H:-5}"       # the gen job stops starting new chunks after this many hours and exits cleanly (datasets interleaved); MODE=resume continues
+export RESCUE_SHARD="${RESCUE_SHARD:-}"        # MODE=rescue: finish ONE crashed shard's leftover chunks using all GPUs
 export ORIG_NSHARDS="${ORIG_NSHARDS:-4}"
+export UNC_N="${UNC_N:-400}"                   # uncertainty POC: problems per dataset (gsm8k, math); output goes to $RUN_DIR/unc_n$UNC_N
+export N_ROLL="${N_ROLL:-16}"                  # prompt-end rollouts per problem
+export N_CONT="${N_CONT:-8}"                   # continuations per checkpoint (o48, o96)
+export UNC_BUDGET_H="${UNC_BUDGET_H:-3}"       # rollout job stops starting new chunks after this many hours (resumable)
+# ---- mega run (GSM8K only; four independent threads, see docs/MEGA.md) ----
+export MEGA_DIR="${MEGA_DIR:-$RUN_DIR/mega}"
+export MEGA_STEPS_H="${MEGA_STEPS_H:-4}"       # budget (hours) of the step-edit generation job; resumable, a cut-off leaves a random subset of problems
+export MEGA_UNC_H="${MEGA_UNC_H:-3}"           # budget of the uncertainty rollout job
+export MEGA_STEER_H="${MEGA_STEER_H:-2}"       # budget of the steering job
+export MEGA_UNC_N="${MEGA_UNC_N:-2000}"        # unseen GSM8K problems for the uncertainty thread (the 400 from the POC are skipped)
+export MEGA_UNC_SKIP="${MEGA_UNC_SKIP:-400}"
+export MEGA_N_ROLL="${MEGA_N_ROLL:-16}"
+export MEGA_MAX_STEPS="${MEGA_MAX_STEPS:-8}"   # numeric steps edited per solution
+export MEGA_CHUNK="${MEGA_CHUNK:-8}"           # problems per resumable chunk in the steps thread
+export MEGA_STEER_N="${MEGA_STEER_N:-0}"       # 0 = all GSM8K test problems
 export GATE_LIMIT="${GATE_LIMIT:-64}"          # problems per dataset in MODE=gate
 
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}" TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
@@ -35,7 +49,7 @@ export TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1
 # If neither is set it falls back to e-mail to SLACK_EMAIL (sendmail, mail, local SMTP) - not available on Fir nodes.
 # usage: notify "subject" ["body"]
 notify() {
-  local subject="[susc ${RUN_NAME}] $1" body="${2:-}" text sent=0 sm msg
+  local subject="[psuite ${RUN_NAME}] $1" body="${2:-}" text sent=0 sm msg
   echo "[notify] $subject"
   text="*${subject}*"$'\n'"${body}"$'\n'"host=$(hostname) job=${SLURM_JOB_ID:-login}"
   if [[ -n "${SLACK_WEBHOOK_URL:-}" ]]; then
@@ -50,7 +64,7 @@ notify() {
     else echo "[notify] ntfy post failed"; fi
   fi
   [[ $sent == 1 || -z "${SLACK_EMAIL:-}" ]] && return 0
-  msg="$(printf 'To: %s\nFrom: %s@%s\nSubject: %s\n\n%s\n' "$SLACK_EMAIL" "${USER:-susc}" "$(hostname)" "$subject" "$text")"
+  msg="$(printf 'To: %s\nFrom: %s@%s\nSubject: %s\n\n%s\n' "$SLACK_EMAIL" "${USER:-psuite}" "$(hostname)" "$subject" "$text")"
   sm="$(command -v sendmail 2>/dev/null || ls /usr/sbin/sendmail /usr/lib/sendmail 2>/dev/null | head -n1 || true)"
   if [[ -n "$sm" ]] && printf '%s\n' "$msg" | "$sm" -t 2>/dev/null; then return 0; fi
   if command -v mail >/dev/null 2>&1 && printf '%s\n' "$text" | mail -s "$subject" "$SLACK_EMAIL" 2>/dev/null; then return 0; fi
@@ -63,3 +77,11 @@ with smtplib.SMTP("localhost", 25, timeout=20) as s:
   return 0
 }
 
+
+# ---- inject run (error propagation at injection time + steering at large doses; needs the mega steps outputs) ----
+export INJECT_H="${INJECT_H:-1.5}"              # budget (hours) of the injection-state extraction (forwards only; ~20-40 min expected on 4 GPUs)
+export INJECT_CHUNK="${INJECT_CHUNK:-16}"       # problems per resumable chunk
+export STEER_BIG_H="${STEER_BIG_H:-3}"          # budget of the large-dose steering job
+export STEER_BIG_DOSES="${STEER_BIG_DOSES:-4,8,16,32}"   # |alpha| in probe-projection sds, applied as +/-
+export STEER_BIG_NRAND="${STEER_BIG_NRAND:-4}"
+export STEER_BIG_DIR="${STEER_BIG_DIR:-steer_big}"

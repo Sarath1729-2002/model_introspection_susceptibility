@@ -1,7 +1,7 @@
 [project]
-name = "susc"
+name = "psuite"
 version = "0.1.0"
-description = "Probing and monitoring hint-adoption (sycophancy susceptibility) in an instruction-tuned LLM"
+description = "Probe suite: what a frozen LLM's residual stream linearly encodes about its own continuation (runaway, length, constraint compliance, answer settledness)"
 requires-python = ">=3.10"
 dependencies = ["torch", "transformers", "accelerate", "datasets", "numpy", "pandas", "matplotlib"]
 [build-system]

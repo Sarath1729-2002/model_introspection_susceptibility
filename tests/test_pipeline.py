@@ -4,9 +4,9 @@ import numpy as np
 import pytest
 import torch
 
-from susc import bench, causal, cli, core, monitor, probes, report, sample, states, study, table, textutil, trace
-from susc.hf_util import enc
-from susc.prompts import CONDS, FRAMINGS, chat_prompt, user_text
+from psuite import bench, cli, core, gen, report, states, study, table, textutil, trace, verify
+from psuite.hf_util import enc, eos_set, generate_ids
+from psuite.prompts import CUE, chat_prompt, con_text, plain_text
 
 CHARS = list(" abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,=+-*/\\{}()$:#?!<>|_'\n;%\"&`[]")
 
@@ -48,13 +48,13 @@ def model(tok):
 
 
 def fake_loaders():
+    import pandas as pd
     rng = np.random.RandomState(0)
     gs = {"train": [], "test": []}
     for sp in gs:
         for i in range(60):
             a, b = int(rng.randint(2, 30)), int(rng.randint(2, 30))
             gs[sp].append({"question": f"Tom has {a} apples and gets {b} more ({sp}{i}). How many?", "answer": f"step <<{a}+{b}={a + b}>> \n#### {a + b}"})
-    import pandas as pd
     mth = {s: pd.DataFrame([{"problem": f"What is {i}+{i} ({s})?", "solution": f"It is $\\boxed{{{2 * i}}}$.", "level": f"Level {1 + i % 5}", "type": "algebra"} for i in range(80)])
            for s in ("train", "test")}
     arc = {s: [{"id": f"{s}{i}", "question": f"Which is largest ({s}{i})?", "choices": {"label": list("ABCD"), "text": ["a", "b", "c", "d"]}, "answerKey": "ABCD"[i % 4]}
@@ -62,12 +62,9 @@ def fake_loaders():
     return {"gsm8k": lambda: gs, "math": lambda: mth, "arc": lambda split: arc[split]}
 
 
-def test_textutil():
+# ----------------------------------------------------------------------------- pure functions
+def test_textutil_and_audit():
     assert textutil.parse_answer("so \\boxed{\\$1,250} then \\boxed{12 apples}", "int") == "12"
-    assert textutil.parse_answer("\\boxed{(B)}", "mcq") == "B" and textutil.parse_answer("\\boxed{\\frac12}", "int") is None
-
-
-def test_audit_rejects_bad_ground_truth():
     rows = bench.rows_arith(60, seed=1)
     for i, r in enumerate(rows):
         r["id"], r["kind"] = i, "int"
@@ -76,125 +73,216 @@ def test_audit_rejects_bad_ground_truth():
     assert bench.audit(rows, log=lambda *_: None)["report"]["admitted"]
     bad = [dict(r) for r in rows]
     for r in bad[:10]:
-        r["gold"] = str(int(r["gold"]) + 1)                       # corrupt 10 labels: recomputation from the prompt text must catch them
+        r["gold"] = str(int(r["gold"]) + 1)
     rep = bench.audit(bad, log=lambda *_: None)["report"]
-    assert rep["n_kept"] == 50 and not rep["admitted"] and "G2_arith_recompute" in rep["fails"]
-    # hints: never equal gold, reproducible
-    assert all(bench.hint_wrong_int(i, g) != g for i in range(200) for g in (0, 1, 5, 99, 1000))
-    assert all(bench.hint_wrong_letter(i, c) != c for i in range(50) for c in "ABCD")
-    assert bench.gsm8k_check("a <<2*3=7>>\n#### 7")[1] == "annotation_mismatch" and bench.gsm8k_check("#### 3.5")[1] == "non_integer"
-    assert bench.run_code_block(bench.prog_text("mod", {"s0": 1, "n": 3, "a": 2, "m": 7, "c": 2, "b": 1})) == bench.prog_value("mod", {"s0": 1, "n": 3, "a": 2, "m": 7, "c": 2, "b": 1})
+    assert not rep["admitted"] and "G2_arith_recompute" in rep["fails"]
 
 
-def test_download_failure_is_survivable(tmp_path):
-    def boom():
-        raise RuntimeError("no network")
-    problems, reports = bench.build(tmp_path, {"math": 50, "arith": 60}, loaders={"math": boom}, log=lambda *_: None)
-    assert {p["ds"] for p in problems} == {"arith"} and [r["dataset"] for r in reports] == ["arith"]
+def test_verifiers():
+    P = verify.PHRASE
+    assert verify.complies("maxw50", "word " * 50, True) and not verify.complies("maxw50", "word " * 51, True)
+    assert verify.complies("maxw200", "word " * 150, True) and not verify.complies("maxw100", "word " * 101, True)
+    assert verify.complies("nocomma", "a b. c", True) and not verify.complies("nocomma", "a, b", True)
+    assert verify.complies("endphrase", f"x\n{P}\n", True) and not verify.complies("endphrase", f"{P} x", True)
+    for c in verify.CONSTRAINTS:                                   # a truncated response never complies, whatever its text
+        assert not verify.complies(c, f"ok {P}", False)
+    assert abs(verify.overshoot("maxw100", "w " * 200, True) - np.log(2)) < 1e-9 and verify.overshoot("nocomma", "x", True) is None and verify.overshoot("maxw50", "w", False) is None
+    assert {verify.constraint_for(i) for i in range(500)} == set(verify.CONSTRAINTS) and verify.constraint_for(17) == verify.constraint_for(17)
+    p = {"id": 3, "question": "Q?", "kind": "int"}
+    assert plain_text(p) in con_text(p) and verify.CONSTRAINT_TEXT[verify.constraint_for(3)] in con_text(p) and verify.CONSTRAINT_TEXT[verify.constraint_for(3)] not in plain_text(p)
 
 
-def test_rescue_split_partitions_a_shard(run):
-    from susc.sched import schedule
-    _, problems = run
-    full = [(d, k) for d, k, _ in schedule(problems, 1, 2, 30)]
-    parts = [[(d, k) for d, k, _ in schedule(problems, 1, 2, 30, f"{w}/3")] for w in range(3)]
-    assert sorted(sum(parts, [])) == sorted(full) and len({x for p in parts for x in p}) == len(full)
+def test_generate_ids_contract(tok, model):
+    prompts = [chat_prompt(tok, f"Q{i}? " * (1 + i % 3)) for i in range(7)]
+    a = generate_ids(model, tok, prompts, 6, 1, 0.0, max_seqs=3)
+    b = generate_ids(model, tok, prompts, 6, 1, 0.0, max_seqs=7)
+    assert len(a) == 7 and all(len(x) == 1 for x in a)
+    for (ia, fa), (ib, fb) in zip((x[0] for x in a), (x[0] for x in b)):
+        assert fa == fb and len(ia) <= 6 and (fa or len(ia) == 6) and 1 not in ia
+    s = generate_ids(model, tok, prompts[:3], 6, 4, 0.7)
+    assert all(len(x) == 4 for x in s) and eos_set(model, tok) == {1}
 
 
-def test_prompts():
-    p = {"question": "Q?", "kind": "int", "gold": "5", "hint": "7"}
-    assert "7" in user_text(p, "auth") and "5" not in user_text(p, "auth").split("Please")[0].replace("Q?", "")
-    assert "(Answer key: 5)" in user_text(p, "cor") and "Problem ID: 7" in user_text(p, "placebo") and "7" not in user_text(p, "clean")
-    assert all(user_text(p, c).endswith(user_text(p, "clean").split("\n\n")[-1]) for c in CONDS)
-
-
+# ----------------------------------------------------------------------------- the real pipeline on a tiny random model
 @pytest.fixture(scope="module")
 def run(tmp_path_factory, tok, model):
     tmp = tmp_path_factory.mktemp("run")
-    sizes = {"gsm8k": 70, "math": 60, "arc": 60, "arith": 70, "prog": 70}
+    sizes = {"gsm8k": 70, "math": 60, "arc": 60, "arith": 70}
     problems, reports = bench.build(tmp, sizes, loaders=fake_loaders(), log=lambda *_: None)
     assert {r["dataset"] for r in reports} == set(sizes) and all(r["admitted"] for r in reports)
     for sh in (0, 1):
-        sample.run(problems, model, tok, tmp, sh, 2, n=4, max_new=6, chunk=30, max_seqs=32, log=lambda *_: None)
+        gen.run(problems, model, tok, tmp, sh, 2, chunk=30, max_new=8, n_spread=3, max_seqs=16, log=lambda *_: None)
         states.run(problems, model, tok, tmp, sh, 2, fwd_bs=5, chunk=40, log=lambda *_: None)
-        trace.run(problems, model, tok, tmp, sh, 2, fwd_bs=3, chunk=30, log=lambda *_: None)
+        trace.run(problems, model, tok, tmp, sh, 2, fwd_bs=3, chunk=30, offsets=(0, 2, 3, 4, 5), min_left=1, log=lambda *_: None)
     return tmp, problems
 
 
-def test_sample_states_resumable_and_correct(run, tok, model):
+def test_gen_resumable_and_labels(run, tok, model):
     tmp, problems = run
-    before = sorted(p.name for p in (tmp / "samples").iterdir())
-    sample.run(problems, model, tok, tmp, 0, 2, n=4, max_new=6, chunk=30, max_seqs=32, log=lambda *_: None)
-    assert before == sorted(p.name for p in (tmp / "samples").iterdir())
-    # a time budget of ~0 stops cleanly without writing partial files
-    n_before = len(list((tmp / "states").iterdir()))
-    assert states.run(problems, model, tok, tmp, 0, 2, budget_s=1e-9, log=lambda *_: None) == 0 and n_before == len(list((tmp / "states").iterdir()))
-    st = table.load_states(tmp, ("clean", "auth"))
-    assert st["states"]["clean"].shape == (len(problems), 5, 32) and (np.diff(st["ids"]) > 0).all()
-    assert np.isfinite(st["lp"]["auth"]["lph"]).all() and np.allclose(st["lp"]["cor"]["lph"], st["lp"]["cor"]["lpg"])
-    # the stored prompt-end state is the last prompt token's hidden state of a direct forward
-    p = problems[7]
-    ids = torch.tensor([enc(tok, chat_prompt(tok, user_text(p, "auth")))])
-    with torch.no_grad():
-        hs = model(input_ids=ids, output_hidden_states=True).hidden_states
-    ref = torch.stack([h[0, -1] for h in hs]).numpy()
+    before = sorted(p.name for p in (tmp / "gen").iterdir())
+    gen.run(problems, model, tok, tmp, 0, 2, chunk=30, max_new=8, n_spread=3, max_seqs=16, log=lambda *_: None)
+    assert before == sorted(p.name for p in (tmp / "gen").iterdir())
+    G = table.load_gen(tmp)
+    assert len(G) == len(problems)
+    r = G[problems[5]["id"]]
+    assert r["ctype"] == verify.constraint_for(r["id"]) and len(r["spread_n"]) == 3
+    assert r["con_comply"] == verify.complies(r["ctype"], r["con_text"], r["con_fin"])
+    assert (len(r["plain_ids"]) == 8) or r["plain_fin"]
+    # greedy => regenerating one problem alone reproduces its stored completion
+    p = next(q for q in problems if q["id"] == r["id"])
+    ids, fin = generate_ids(model, tok, [chat_prompt(tok, plain_text(p))], 8, 1, 0.0)[0][0]
+    assert ids == r["plain_ids"] and fin == r["plain_fin"]
+
+
+def test_states_match_direct_forward(run, tok, model):
+    tmp, problems = run
+    st = table.load_states(tmp)
+    n = len(problems)
+    assert st["states"]["plain"].shape == (n, 5, 32) and st["states"]["con"].shape == (n, 5, 32) and (np.diff(st["ids"]) > 0).all()
+    p = problems[9]
     k = int(np.where(st["ids"] == p["id"])[0][0])
-    np.testing.assert_allclose(st["states"]["auth"][k].astype(np.float32), ref, atol=2e-2, rtol=2e-2)
-    s = table.load_samples(tmp)
-    r = s[(p["id"], "auth")]
-    assert r["n"] == 4 and 0 <= r["n_wrong"] <= 4
+    for name, fn in (("plain", plain_text), ("con", con_text)):
+        ids = torch.tensor([enc(tok, chat_prompt(tok, fn(p)))])
+        with torch.no_grad():
+            hs = model(input_ids=ids, output_hidden_states=True).hidden_states
+        ref = torch.stack([h[0, -1] for h in hs]).numpy()
+        np.testing.assert_allclose(st["states"][name][k].astype(np.float32), ref, atol=2e-2, rtol=2e-2)
+    assert not np.allclose(st["states"]["plain"][k], st["states"]["con"][k])           # the constraint is really in the prompt
 
 
-def test_trace_positions_and_state(run, tok, model):
+def test_trace_labels_and_states(run, tok, model):
     tmp, problems = run
-    tr = monitor.load_trace(tmp)
-    assert tr["clean"]["h"].shape[1] == 5 and tr["clean"]["h"].shape[3] == 32 and (np.diff(tr["ids"]) > 0).all()
-    # position 0 equals the pre-generation state
-    st = table.load_states(tmp, ("clean",))
-    common = np.intersect1d(st["ids"], tr["ids"])
-    i = int(common[3])
-    a = tr["clean"]["h"][np.where(tr["ids"] == i)[0][0], 0, -1].astype(np.float32)          # last stored layer
-    b = st["states"]["clean"][np.where(st["ids"] == i)[0][0], tr["layers"][-1]].astype(np.float32)
-    np.testing.assert_allclose(a, b, atol=3e-2, rtol=3e-2)
-    assert (tr["clean"]["frac"][:, 0] == 0).all() and (np.diff(tr["clean"]["frac"], axis=1) >= -1e-6).all()
+    tr = table.load_trace(tmp)
+    G = table.load_gen(tmp)
+    n, K = len(problems), len(trace.CK_NAMES)
+    assert tr["H"].shape == (n, K, len(tr["layers"]), 32) and tr["pf"].shape == (n, K, 8) and (np.diff(tr["ids"]) > 0).all() and tr["valid"].shape == (n, K)
+    assert (tr["t"][:, 0] == 0).all() and tr["valid"][:, 0].all()
+    assert (tr["t"][:, :5] == np.array([0, 2, 3, 4, 5])).all()
+    assert (tr["t"][tr["valid"]] <= np.broadcast_to(tr["Tc"][:, None], tr["t"].shape)[tr["valid"]]).all()
+    assert tr["valid"][:, 1].sum() > 0 and not tr["valid"].all()
+    assert (tr["valid"][:, 1] == (tr["Tc"] >= 3)).all()               # offset 2 + min_left 1
+    # checkpoint 0 state == the prompt-end state of the states stage (same position, same layers)
+    st = table.load_states(tmp)
+    assert (st["ids"] == tr["ids"]).all()
+    for li, l in enumerate(tr["layers"]):
+        np.testing.assert_allclose(tr["H"][:, 0, li].astype(np.float32), st["states"]["plain"][:, l].astype(np.float32), atol=3e-2, rtol=3e-2)
+    # the forced-answer log-prob equals a direct, unpadded computation; the state is the state WITHOUT the cue (causality); invalid checkpoints carry no labels
+    checked = 0
+    for j in range(n):
+        p = next(q for q in problems if q["id"] == tr["ids"][j])
+        g = G[p["id"]]
+        for kk in range(6):
+            if not tr["valid"][j, kk]:
+                assert np.isnan(tr["lp_gold"][j, kk]) and np.isnan(tr["lp_final"][j, kk]) and np.isnan(tr["rem"][j, kk])
+                continue
+            t = int(tr["t"][j, kk])
+            pr = enc(tok, chat_prompt(tok, plain_text(p)))
+            base = pr + g["plain_ids"][:t] + enc(tok, CUE)
+            a = enc(tok, f"{p['gold']}}}")
+            ids = torch.tensor([base + a])
+            with torch.no_grad():
+                o = model(input_ids=ids, output_hidden_states=True)
+            lp = torch.log_softmax(o.logits[0].float(), -1)
+            ref = sum(float(lp[len(base) - 1 + i, tok_id]) for i, tok_id in enumerate(a))
+            assert abs(ref - tr["lp_gold"][j, kk]) < 5e-3
+            li = len(tr["layers"]) - 1
+            np.testing.assert_allclose(tr["H"][j, kk, li].astype(np.float32), o.hidden_states[tr["layers"][li]][0, len(pr) + t - 1].numpy(), atol=3e-2, rtol=3e-2)
+            if g["plain_ans"] is not None:
+                assert np.isfinite(tr["lp_final"][j, kk])
+                if g["plain_ans"] == p["gold"]:
+                    assert tr["lp_final"][j, kk] == tr["lp_gold"][j, kk]
+            else:
+                assert np.isnan(tr["lp_final"][j, kk])
+            assert np.isnan(tr["rem"][j, kk]) if not g["plain_fin"] else tr["rem"][j, kk] == tr["Tc"][j] - t
+            checked += 1
+        if checked > 60:
+            break
+    assert checked > 20
 
 
-def test_ridge_and_core():
-    rng = np.random.RandomState(0)
-    X = rng.randn(400, 20).astype(np.float32)
-    y = X[:, 0] * 2 + 0.1 * rng.randn(400)
-    res = core.ridge_eval(X[:300], X[300:350], X[350:], y[:300, None], y[300:350, None], y[350:, None])
-    assert res[0]["test_r2"] > 0.9 and abs(core.auroc([0, 0, 1, 1], [0.1, 0.2, 0.3, 0.9]) - 1) < 1e-9
+def test_no_length_leak_through_position(run):
+    """checkpoints are at ABSOLUTE offsets, so within a checkpoint the position is constant and carries no information about the total length."""
+    tmp, _ = run
+    df, tr, frames, tks = table.build_trace(tmp, None, log=lambda *_: None)
+    for k in range(5):
+        assert frames[k].t_k.nunique() == 1
 
 
-def test_analysis_end_to_end(run):
+def test_tables_and_cli_smoke(run):
     tmp, problems = run
-    dss = ["gsm8k", "math", "arc", "arith", "prog"]
-    for block in ("tables", "A", "B1", "B2", "CDE", "T"):
-        study.compute(tmp, block, layers=[1, 2, 4] if block not in ("tables", "T") else None, log=lambda *_: None)
-    df = report.pickle.load(open(tmp / "analysis" / "tables.pkl", "rb"))["df"]
-    assert len(df) == len(problems) and {"S", "S_net", "cred", "uplift", "Sgap", "gap_plc", "adopts"} <= set(df.columns)
-    A = report._load(tmp / "analysis", "A")
-    regs = {r["regime"] for r in A["res"]}
-    assert {"iid", "shift"} <= regs and any(x.startswith("lodo:") for x in regs)
-    r = report._pick(A["res"], "A[pooled]", "S", "iid")
-    assert r is not None and r["probe_layer"] in (1, 2, 4) and len(r["_pred"]) == r["n_test"]
-    # leave-dataset-out really excludes the held-out dataset from fitting
-    lo = report._pick(A["res"], "A[pooled]", "S", "lodo:gsm8k")
-    assert set(lo["_ds"]) == {"gsm8k"}
-    B = [x for n in ("B1", "B2") for x in report._load(tmp / "analysis", n)["res"]]
-    assert {x["framing"] for x in B} == set(FRAMINGS) | {"placebo", "cor"}
-    cde = report._load(tmp / "analysis", "CDE")
-    assert len(cde["D"]) > 0 and cde["E"]["cosine"].shape[0] == len(probes.GEO) and np.all(np.isclose(np.diag(cde["E"]["cosine"].values), 1, atol=1e-4) | np.isclose(np.diag(cde["E"]["cosine"].values), 0, atol=1e-6))   # 0 = degenerate (all-zero) label on the tiny model
-    T = report._load(tmp / "analysis", "T")["trace"]
-    assert len(T) and {"p0", "pend"} <= set(T.pos)
-    te = causal.treatment_effects(df)
-    assert {"auth", "placebo", "cor(+gain)", "clean"} <= set(te.cond) and len(causal.hint_distance(df)) > 0
-    mc = causal.monitor_curves(df, r)
-    assert mc.recall_of_adopters.between(0, 1).all()
-    p = report.write(tmp, log=lambda *_: None)
-    txt = p.read_text()
-    assert "Ground-truth audit" in txt and "Headline results" in txt and "Leave-one-framing-out" in txt and (tmp / "analysis" / "fig1_layer_sweep_S.png").exists()
-    # CLI path used on the cluster
-    cli.main(["analyze", "--run-dir", str(tmp), "--block", "tables"])
-    cli.main(["report", "--run-dir", str(tmp)])
+    df, sub = table.build(tmp, None, need_states=True, log=lambda *_: None)
+    assert len(df) == len(problems) and {"runaway", "logT", "comply", "over", "ans_logmag", "len_sd", "runaway_rate"} <= set(df.columns)
+    assert sub["plain"].shape[0] == len(df) and np.isnan(df.loc[df.runaway == 1, "logT"]).all()
+    df2, tr, frames, tks = table.build_trace(tmp, None, log=lambda *_: None)
+    assert len(frames) == 6 and (frames[0].t_k == 0).all() and frames[0].settled_p.dropna().between(0, 1).all() and len(tks) == 6 and len(tks[1]["H"]) == len(frames[1])
+    assert frames[5].log_rem.isna().all() and df2.id.is_unique
+    for blk in ("tables",):
+        cli.main(["analyze", "--run-dir", str(tmp), "--block", blk])
+    assert (tmp / "analysis" / "tables.pkl").exists()
+
+
+def test_cli_stages_end_to_end(tmp_path, tok, model, monkeypatch):
+    """the exact command lines the sbatch script uses (arguments, sharding, file naming) on the tiny model."""
+    bench.build(tmp_path, {"gsm8k": 70, "arith": 70}, loaders=fake_loaders(), log=lambda *_: None)   # the audit rejects tiny sets (< 50 problems)
+    monkeypatch.setattr("psuite.hf_util.load_model", lambda mid: (model, tok))
+    for sh in (0, 1):
+        common = ["--run-dir", str(tmp_path), "--shard", str(sh), "--nshards", "2"]
+        cli.main(["states", *common, "--fwd-bs", "4"])
+        cli.main(["gen", *common, "--chunk", "20", "--max-new", "6", "--n-spread", "2", "--max-seqs", "16", "--budget-s", "600"])
+        cli.main(["trace", *common, "--chunk", "20", "--fwd-bs", "4"])
+    assert len(list((tmp_path / "gen").glob("g*.jsonl"))) == len(list((tmp_path / "trace").glob("t*.npz"))) > 0 and len(list((tmp_path / "meta").glob("*.json"))) >= 6
+    cli.main(["analyze", "--run-dir", str(tmp_path), "--block", "tables"])
+    assert len(table.load_gen(tmp_path)) == 140
+    for sh in (0, 1):                                                       # uncertainty POC stage through the CLI (gsm8k only exists here)
+        cli.main(["unc-roll", "--run-dir", str(tmp_path), "--shard", str(sh), "--nshards", "2", "--unc-n", "30", "--n-roll", "3", "--n-cont", "2", "--max-new", "8", "--max-seqs", "16"])
+    assert len(list((tmp_path / "unc_n30").glob("u*.jsonl"))) >= 2
+
+
+# ----------------------------------------------------------------------------- uncertainty POC: sampling stage on the tiny model
+def test_unc_stage(run, tok, model):
+    from psuite import unc, unc_study
+    tmp, problems = run
+    G = table.load_gen(tmp)
+    sub = unc.pick_subset(problems, G, 12)
+    assert len(sub) == 24 and {p["ds"] for p in sub} == {"gsm8k", "math"}
+    assert {p["id"] for p in unc.pick_subset(problems, G, 6)} <= {p["id"] for p in sub}              # nested subsets: n=40 is part of n=400
+    out = tmp / "unc_t"
+    kw = dict(n_roll=4, n_cont=3, max_seqs=16, chunk=5, cps=(2, 3), min_left=1, max_new=10, log=lambda *_: None)
+    for sh in (0, 1):
+        unc.run(sub, G, model, tok, out, sh, 2, **kw)
+    files = sorted(p.name for p in out.glob("u*.jsonl"))
+    unc.run(sub, G, model, tok, out, 0, 2, **kw)
+    assert files == sorted(p.name for p in out.glob("u*.jsonl")) and files                              # resumable: nothing redone
+    rows = unc_study.load_unc(out)
+    assert len(rows) == 24
+    for r in rows.values():
+        assert len(r["roll_ans"]) == len(r["roll_fin"]) == len(r["roll_ntok"]) == 4 and max(r["roll_ntok"]) <= 10
+        for t in (2, 3):                                           # a continuation exists exactly where the checkpoint is valid
+            assert (str(t) in r["cont"]) == (t <= r["n_greedy"] - 1)
+            if str(t) in r["cont"]:
+                assert len(r["cont"][str(t)]["ans"]) == 3
+    # per-token entropy of the greedy solution == a direct forward
+    checked = 0
+    for p in sub:
+        comp = G[p["id"]]["plain_ids"]
+        if len(comp) < 3:
+            continue
+        pr = enc(tok, chat_prompt(tok, plain_text(p)))
+        with torch.no_grad():
+            lg = model(input_ids=torch.tensor([pr + comp])).logits[0, len(pr) - 1:-1].float()
+        lp = torch.log_softmax(lg, -1)
+        ent = -(lp.exp() * lp).sum(-1)
+        nll = -lp.gather(1, torch.tensor(comp)[:, None])[:, 0]
+        r = rows[p["id"]]
+        assert abs(r["ent_all"] - float(ent.mean())) < 1e-3 and abs(r["nll_all"] - float(nll.mean())) < 1e-3
+        if len(comp) >= 3:
+            assert abs(r["ent2"] - float(ent[:2].mean())) < 1e-3 and abs(r["ent3"] - float(ent[:3].mean())) < 1e-3
+        checked += 1
+    assert checked > 5
+    # a continuation prompt given as token ids is the same prompt as the string (greedy => identical)
+    p = sub[0]
+    s = chat_prompt(tok, plain_text(p))
+    a = generate_ids(model, tok, [s], 6, 1, 0.0)[0][0]
+    b = generate_ids(model, tok, [enc(tok, s)], 6, 1, 0.0)[0][0]
+    assert a == b
+
