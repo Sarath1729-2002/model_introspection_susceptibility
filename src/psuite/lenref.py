@@ -54,7 +54,7 @@ def analyze(run_dir: Path, ds: str = "gsm8k", log=print) -> dict:
     meds = [np.median([n for n, f in zip(r["spread_n"], r["spread_fin"]) if f]) if sum(r["spread_fin"]) >= 2 else np.nan for r in sp]
     samp_floor = float(np.nanmean(floors)) if np.isfinite(floors).any() else float("nan")
     oracle = float(np.nanmean(np.abs(yt - np.array(meds)))) if np.isfinite(meds).any() else float("nan")
-    out = {"status": "ok", "ds": ds, "n_problems": n_all, "n_terminated": n_fin, "excluded_share": float(1 - n_fin / n_all), "n_test": int(len(test)), "probe_layer": int(layers[pr["layer"]]),
+    out = {"status": "ok", "ds": ds, "n_problems": n_all, "n_terminated": n_fin, "excluded_share": float(1 - n_fin / n_all), "n_test": int(len(test)), "probe_layer": int(pr["layer"]),
            "floor_mae": floor, "probe_mae": mae(pr["pred"]), "probe_over_floor": mae(pr["pred"]) / floor, "surface_mae": mae(sr["pred"]), "surface_over_floor": mae(sr["pred"]) / floor,
            "shuffled_mae": mae(sh["pred"]), "shuffled_over_floor": mae(sh["pred"]) / floor, "probe_spearman": float(spearman(yt, pr["pred"])),
            "sampling_floor_loo_mad": samp_floor, "greedy_vs_sampled_median_mae": oracle}

@@ -74,6 +74,9 @@ class SteerLast:
             self.h.remove()
 
 
+LONG = 1500                                                                                       # total tokens above which the NLL pass goes one sequence at a time
+
+
 def nll_under_model(model, tok, prompts, gens, bs=8):
     """mean per-token NLL of each generated continuation under the UNSTEERED model (the paper's quality check: a steered text that the unsteered model finds very unlikely is degraded text)."""
     import torch
@@ -87,16 +90,32 @@ def nll_under_model(model, tok, prompts, gens, bs=8):
         idx = [i for i in order[s:s + bs] if len(seqs[i][1]) > 0]
         if not idx:
             continue
-        full = [seqs[i][0] + seqs[i][1] for i in idx]
-        W = max(len(x) for x in full)
-        ids = torch.tensor([x + [pad] * (W - len(x)) for x in full], device=dev)
-        att = torch.tensor([[1] * len(x) + [0] * (W - len(x)) for x in full], device=dev)
-        with torch.no_grad():
-            lp = torch.log_softmax(model(input_ids=ids, attention_mask=att).logits.float(), dim=-1)
-        for r, i in enumerate(idx):
-            a, n = len(seqs[i][0]), len(seqs[i][1])
-            tgt = ids[r, a:a + n]
-            out[i] = float(-lp[r, a - 1:a + n - 1].gather(1, tgt[:, None]).mean())
+        if max(len(seqs[i][0]) + len(seqs[i][1]) for i in idx) > LONG:                      # long reasoning traces: one sequence at a time, logits only for the continuation positions
+            groups = [[i] for i in idx]
+        else:
+            groups = [idx]
+        for grp in groups:
+            full = [seqs[i][0] + seqs[i][1] for i in grp]
+            W = max(len(x) for x in full)
+            ids = torch.tensor([x + [pad] * (W - len(x)) for x in full], device=dev)
+            att = torch.tensor([[1] * len(x) + [0] * (W - len(x)) for x in full], device=dev)
+            with torch.no_grad():
+                if len(grp) == 1:
+                    n = len(seqs[grp[0]][1])
+                    lg = model(input_ids=ids, attention_mask=att, logits_to_keep=n + 1).logits[0]          # [n+1, V], positions a-1 .. a+n-1
+                    tgt = ids[0, -n:]
+                    tot = 0.0
+                    for c in range(0, n, 1024):
+                        lp = torch.log_softmax(lg[c:min(c + 1024, n)].float(), dim=-1)
+                        tot += float(-lp.gather(1, tgt[c:c + lp.shape[0], None]).sum())
+                    out[grp[0]] = tot / n
+                    del lg
+                    continue
+                lp = torch.log_softmax(model(input_ids=ids, attention_mask=att).logits.float(), dim=-1)
+            for r, i in enumerate(grp):
+                a, n = len(seqs[i][0]), len(seqs[i][1])
+                tgt = ids[r, a:a + n]
+                out[i] = float(-lp[r, a - 1:a + n - 1].gather(1, tgt[:, None]).mean())
     return out
 
 

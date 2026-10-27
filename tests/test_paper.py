@@ -174,3 +174,30 @@ def test_paper_end_to_end_and_cli(planted, tmp_path, monkeypatch):
     assert "## Verdict" in txt and "A / GSM8K" in txt and "## 2. The ladder" in txt and "B / missing" not in txt.split("## 1.")[0]
     assert (tmp / "paper" / "paper_ladder.csv").exists() and (tmp / "paper" / "fig_ladder.png").exists()
     cli.main(["cell-analyze", "--run-dir", str(tmp), "--mega-dir", str(md), "--ds", "gsm8k"])
+
+
+# ----------------------------------------------------------------------------- regressions found on the cluster
+def test_nll_long_path_matches_batched_path(tok, model, monkeypatch):
+    from psuite import istear
+    prompts = ["What is 3+4?", "What is 10+11 and more words?", "Hi"]
+    gens = [[5, 6, 7, 8], [9, 10], [11, 12, 13]]
+    a = istear.nll_under_model(model, tok, prompts, gens, bs=8)
+    monkeypatch.setattr(istear, "LONG", 1)                                                       # force the one-sequence-at-a-time path used for long reasoning traces
+    b = istear.nll_under_model(model, tok, prompts, gens, bs=8)
+    assert np.allclose(a, b, atol=1e-4) and all(np.isfinite(a))
+
+
+def test_lenref_synthetic_does_not_index_error(monkeypatch, tmp_path):
+    import pandas as pd
+    from psuite import table
+    n, L, D = 400, 9, 16
+    rng = np.random.RandomState(0)
+    T = rng.randint(50, 300, n).astype(float)
+    X = rng.randn(n, L, D).astype(np.float32)
+    X[:, 4, 0] += T / 100                                                                          # lenref probes layers 0, 4, 8, ...; plant the signal at one of them
+    qs = [f"q {i} " + "w " * (i % 7) for i in range(n)]
+    df = pd.DataFrame({"id": np.arange(n), "T": T, "runaway": np.zeros(n), "split": np.where(np.arange(n) % 5 == 0, "test", "fit"), "_q": qs})
+    monkeypatch.setattr(table, "build", lambda *a, **k: (df, {"plain": X}))
+    monkeypatch.setattr(table, "load_gen", lambda *a, **k: {i: {"spread_n": [int(T[i]) + d for d in (-5, 0, 6, 9)], "spread_fin": [True] * 4} for i in range(n)})
+    r = lenref.analyze(tmp_path, "gsm8k", QUIET)
+    assert r["status"] == "ok" and r["probe_layer"] == 4 and r["probe_over_floor"] < 1
