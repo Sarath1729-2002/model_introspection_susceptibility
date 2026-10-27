@@ -43,3 +43,8 @@ One overnight GSM8K-only job with four independent threads (causal step importan
 
 ## Inject run (added)
 Error propagation at injection time (probe on the state at the last token of a number injected into the model's own chain of thought, vs the model's own surprise and the pre-edit state) + steering at large doses. Design and pre-registered rule: `docs/INJECT.md`. After the mega run: `MODE=inject-smoke` / `MODE=inject bash cluster/submit.sh`; report `$RUN_DIR/mega/inject/analysis/INJECT_REPORT.md`.
+
+
+## Robust run (after the inject run)
+`MODE=robust-smoke` then `MODE=robust bash cluster/submit.sh`: robustness checks C1-C7 of `I[num]:flip` (subsets, demeaned label, bag-of-words baselines, shuffled control, paired vs the pre-edit state, AUROC)
+plus a causal steering test at the injected token (C8). Pre-registration and decision rules: `docs/ROBUST.md`. Report: `$MEGA_DIR/robust/analysis/ROBUST_REPORT.md`.

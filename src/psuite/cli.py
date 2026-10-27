@@ -20,7 +20,7 @@ def _write_meta(run: Path, a):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["data", "gen", "states", "trace", "analyze", "report", "unc-roll", "unc-analyze", "steps", "steer-prep", "steer-run", "mega-analyze", "inject", "inject-analyze"])
+    ap.add_argument("cmd", choices=["data", "gen", "states", "trace", "analyze", "report", "unc-roll", "unc-analyze", "steps", "steer-prep", "steer-run", "mega-analyze", "inject", "inject-analyze", "robust-prep", "robust-steer", "robust-offline", "robust-analyze"])
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--model-id", default="Qwen/Qwen2.5-7B-Instruct")
     ap.add_argument("--shard", type=int, default=0)
@@ -48,6 +48,8 @@ def main(argv=None):
     ap.add_argument("--steer-alphas", default="", help="steer-run: comma list of |alpha| doses (applied as +/-); default = the mega run's 1,2,4")
     ap.add_argument("--steer-out", default="steer", help="steer-run: sub-directory of the mega dir for the results (directions are always read from <mega>/steer)")
     ap.add_argument("--steer-nrand", type=int, default=8, help="steer-run: number of random control directions")
+    ap.add_argument("--robust-dir", default="robust", help="robust-*: sub-directory of the mega dir (the smoke run uses robust_smoke); the steering results are in <robust-dir>/steer")
+    ap.add_argument("--robust-n", type=int, default=3000, help="robust-prep: injected test rows to steer")
     ap.add_argument("--parts", default="steps,unc,steer,suite", help="mega-analyze: threads to analyse")
     a = ap.parse_args(argv)
     run = Path(a.run_dir)
@@ -73,6 +75,17 @@ def main(argv=None):
     if a.cmd == "inject-analyze":
         from . import inject
         inject.write_report(run, mega, big_name=a.steer_out if a.steer_out != "steer" else "steer_big")
+        return
+    if a.cmd == "robust-prep":
+        from . import istear
+        istear.prep(run, mega, mega / a.robust_dir / "steer", a.robust_n)
+        return
+    if a.cmd in ("robust-offline", "robust-analyze"):
+        from . import robust
+        if a.cmd == "robust-offline":
+            robust.offline(run, mega, name=a.robust_dir)
+        else:
+            robust.write_report(run, mega, name=a.robust_dir)
         return
     if a.cmd == "steer-prep":
         from . import steer
@@ -123,6 +136,11 @@ def main(argv=None):
         if not sr:
             raise SystemExit(f"no step-thread outcomes in {mega / 'steps'}: run MODE=mega (steps) first")
         inject.run([p for p in problems if p["ds"] == "gsm8k"], G, sr, model, tok, mega / "inject", a.shard, a.nshards, chunk=a.chunk, budget_s=a.budget_s)
+    elif a.cmd == "robust-steer":
+        from . import inject, istear, table
+        G = table.load_gen(run, ["gsm8k"])
+        irows = inject.load(mega / "inject")[0]
+        istear.run([p for p in problems if p["ds"] == "gsm8k"], G, irows, model, tok, mega / a.robust_dir / "steer", a.shard, a.nshards, max_new=a.max_new or 384, max_seqs=a.max_seqs, budget_s=a.budget_s)
     elif a.cmd == "gen":
         from . import gen
         gen.run(problems, model, tok, run, a.shard, a.nshards, chunk=a.chunk, max_new=a.max_new, n_spread=a.n_spread, max_seqs=a.max_seqs, tag=a.tag, budget_s=a.budget_s, sub=a.sub)

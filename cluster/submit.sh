@@ -12,6 +12,7 @@
 #   MODE=mega    bash cluster/submit.sh       # the overnight GSM8K mega run: 4 independent threads (steps / unc / steer / suite) -> $MEGA_DIR/analysis/MEGA_REPORT.md
 #   MODE=mega-analyze bash cluster/submit.sh  # redo only the mega analysis + report
 #   MODE=inject-smoke / MODE=inject bash cluster/submit.sh   # AFTER the mega run: error-propagation-at-injection probe + steering at large doses -> $MEGA_DIR/inject/analysis/INJECT_REPORT.md
+#   MODE=robust-smoke / MODE=robust bash cluster/submit.sh   # AFTER the inject run: robustness checks C1-C7 + causal steering at the injected token (C8) -> $MEGA_DIR/robust/analysis/ROBUST_REPORT.md
 set -euo pipefail
 cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.."
 source cluster/config.sh
@@ -78,6 +79,23 @@ inject|inject-smoke)
   ja=$(STAGE=inject-analyze sbatch "${COMMON[@]}" --job-name="psuite-inject-analyze" --time=02:00:00 --dependency="afterany:$j1:$j2" "${NODE[@]}" cluster/run.sbatch)
   echo "$MODE: inject=$j1 steer-big=$j2 analyze=$ja  -> $MEGA_DIR/inject/analysis/INJECT_REPORT.md   (squeue -u \$USER)"
   notify "$MODE SUBMITTED" "inject=$j1 steer-big=$j2 analyze=$ja"; exit 0 ;;
+robust|robust-smoke)
+  if [[ "$MODE" == "robust-smoke" ]]; then
+    export ROBUST_DIR=robust_smoke ROBUST_N=96 ROBUST_STEER_H=0.15
+    T_ST=01:00:00
+  else
+    hh() { python3 -c "h=float('$1')+0.75;print('%02d:%02d:00'%(int(h),int((h-int(h))*60)))"; }
+    T_ST=$(hh "$ROBUST_STEER_H")
+  fi
+  [[ -f "$MEGA_DIR/steer/dirs.npz" && -n "$(ls "$MEGA_DIR"/steps/s*.jsonl 2>/dev/null | head -n 1)" && -n "$(ls "$MEGA_DIR"/inject/i*.jsonl 2>/dev/null | head -n 1)" ]] || { echo "needs $MEGA_DIR/steps, $MEGA_DIR/inject and $MEGA_DIR/steer/dirs.npz: run MODE=mega and MODE=inject first"; exit 1; }
+  j1=$(sub robust-prep 00:45:00 "" "${NODE[@]}")
+  j2=$(DEPTYPE=afterany sub robust-steer "$T_ST" "$j1" "${NODE[@]}")                  # afterany: a failed prep must not leave the analysis pending; robust-steer then fails fast without dirs.npz
+  j3=$(sub robust-offline 03:00:00 "" "${NODE[@]}")
+  ja=$(STAGE=robust-analyze sbatch "${COMMON[@]}" --job-name="psuite-robust-analyze" --time=02:00:00 --dependency="afterany:$j2:$j3" "${NODE[@]}" cluster/run.sbatch)
+  echo "$MODE: prep=$j1 steer=$j2 offline=$j3 analyze=$ja  -> $MEGA_DIR/$ROBUST_DIR/analysis/ROBUST_REPORT.md   (squeue -u \$USER)"
+  notify "$MODE SUBMITTED" "prep=$j1 steer=$j2 offline=$j3 analyze=$ja"; exit 0 ;;
+robust-analyze)
+  ja=$(sub robust-analyze 02:00:00 "" "${NODE[@]}"); echo "robust-analyze: $ja -> $MEGA_DIR/$ROBUST_DIR/analysis/ROBUST_REPORT.md"; exit 0 ;;
 inject-analyze)
   ja=$(sub inject-analyze 02:00:00 "" "${NODE[@]}"); echo "inject-analyze: $ja -> $MEGA_DIR/inject/analysis/INJECT_REPORT.md"; exit 0 ;;
 mega-analyze)

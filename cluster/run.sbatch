@@ -94,6 +94,20 @@ steer-big)
   notify "steer-big STARTED" "doses ${STEER_BIG_DOSES}, ${STEER_BIG_NRAND} random directions, budget ${STEER_BIG_H}h"
   run_sharded steer-run --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --model-id "$MODEL_ID" --max-seqs "$MAX_SEQS" --steer-n "$MEGA_STEER_N" --steer-alphas "$STEER_BIG_DOSES" --steer-nrand "$STEER_BIG_NRAND" --steer-out "$STEER_BIG_DIR" --budget-s "$(python3 -c "print(int(float('${STEER_BIG_H}')*3600))")"
   notify "steer-big DONE in $(elapsed)" "conditions: $(ls "$MEGA_DIR"/"$STEER_BIG_DIR"/r*.jsonl 2>/dev/null | wc -l)" ;;
+robust-prep)
+  CUDA_VISIBLE_DEVICES=0 python -m psuite.cli robust-prep --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --robust-dir "$ROBUST_DIR" --robust-n "$ROBUST_N"
+  notify "robust-prep DONE in $(elapsed)" "$(cat "$MEGA_DIR/$ROBUST_DIR"/steer/prep.json 2>/dev/null | tr -d '\n' | cut -c1-400)" ;;
+robust-steer)
+  [[ -f "$MEGA_DIR/$ROBUST_DIR/steer/dirs.npz" ]] || { notify "robust-steer: no $MEGA_DIR/$ROBUST_DIR/steer/dirs.npz (robust-prep failed?)"; exit 1; }
+  notify "robust-steer STARTED" "steering at the injected token, ${ROBUST_N} rows/condition, budget ${ROBUST_STEER_H}h"
+  run_sharded robust-steer --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --robust-dir "$ROBUST_DIR" --model-id "$MODEL_ID" --max-seqs "$MAX_SEQS" --max-new "$ROBUST_MAX_NEW" --budget-s "$(python3 -c "print(int(float('${ROBUST_STEER_H}')*3600))")"
+  notify "robust-steer DONE in $(elapsed)" "conditions: $(ls "$MEGA_DIR/$ROBUST_DIR"/steer/r*.jsonl 2>/dev/null | wc -l)" ;;
+robust-offline)
+  CUDA_VISIBLE_DEVICES=1 python -m psuite.cli robust-offline --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --robust-dir "$ROBUST_DIR"
+  notify "robust-offline DONE in $(elapsed)" ;;
+robust-analyze)
+  CUDA_VISIBLE_DEVICES=0 python -m psuite.cli robust-analyze --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --robust-dir "$ROBUST_DIR"
+  notify "ROBUST REPORT ready" "$(sed -n '/## Verdict/,/## Offline checks/p' "$MEGA_DIR/$ROBUST_DIR/analysis/ROBUST_REPORT.md" | cut -c1-500 | head -n 30)" ;;
 inject-analyze)
   CUDA_VISIBLE_DEVICES=0 python -m psuite.cli inject-analyze --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --steer-out "$STEER_BIG_DIR"
   notify "INJECT REPORT ready" "$(sed -n '/## Verdict/,/## Error propagation/p' "$MEGA_DIR/inject/analysis/INJECT_REPORT.md" | cut -c1-500 | head -n 30)" ;;

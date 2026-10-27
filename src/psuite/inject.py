@@ -36,6 +36,15 @@ def num_tokens(tok, suffix_ids: List[int], c0: int, c1: int):
     return first, max(last, first)
 
 
+def edit_geometry(text: str, s: dict, v: str):
+    """-> (edited prefix incl. the whole edited line + newline, new number string, char offsets [c0, c1) of the injected number inside that prefix)."""
+    pre = edited_prefix(text, s, v)
+    nv = edit_value(s["value"], v)
+    nvs = f"{nv:,}" if s["comma"] else str(nv)
+    c0 = s["start"] + s["span"][0]
+    return pre, nvs, c0, c0 + len(nvs)
+
+
 def span_stats(model, h_last, ids: List[int], a: int, b: int) -> dict:
     """surprise of tokens ids[a..b] (absolute indices) under the model, from the final-norm hidden states h_last [T, D]: NLL sum/mean, min log-prob, entropy and probability at the first token."""
     import torch
@@ -187,13 +196,14 @@ def feature_blocks(df, q_of):
     return pos, ed, stp, qf, pf, sp, orc
 
 
-def analyze(run_dir: Path, mega_dir: Path, log=print) -> dict:
+def prepare(run_dir: Path, mega_dir: Path):
+    """-> (dict P, None) with the aligned frame, states and baseline feature blocks, or (None, reason) when there is not enough data."""
     import pandas as pd
-    from . import core, cv_eval, mega
+    from . import mega
     from .bench import read_problems
     rows, HA, HB, layers = load(Path(mega_dir) / "inject")
     if HA is None or len(rows) < 400:
-        return {"status": "n/a", "why": f"only {len(rows)} injected rows - the inject stage did not produce enough data", "md": "(not enough data)\n", "statuses": []}
+        return None, f"only {len(rows)} injected rows - the inject stage did not produce enough data"
     srows, Hs, slayers = mega.load_steps(Path(mega_dir) / "steps")
     probs = {p["id"]: p for p in read_problems(run_dir, ["gsm8k"])}
     df = pd.DataFrame(rows)
@@ -202,7 +212,7 @@ def analyze(run_dir: Path, mega_dir: Path, log=print) -> dict:
     j = np.array([idx.get((i, k), -1) for i, k in zip(df.id, df.k)])
     keep = j >= 0
     if keep.sum() < 400:
-        return {"status": "n/a", "why": f"only {int(keep.sum())} injected rows could be matched to a step-thread state", "md": "(not enough data)\n", "statuses": []}
+        return None, f"only {int(keep.sum())} injected rows could be matched to a step-thread state"
     df, HA, HB, j = df[keep].reset_index(drop=True), HA[keep], HB[keep], j[keep]
     df["split"] = [probs[i]["split"] for i in df.id]
     df["d1"] = [probs[i]["d1"] for i in df.id]
@@ -218,6 +228,16 @@ def analyze(run_dir: Path, mega_dir: Path, log=print) -> dict:
     for l in (8, 16):
         if l in sly:
             bl[f"Hpre{l}(natural-state)"] = pre(l)
+    return {"df": df, "HA": HA, "HB": HB, "ly": ly, "srows": srows, "Hs": Hs, "sly": sly, "j": j, "q": q, "bl": bl, "obs": obs, "orc": orc, "pre": pre}, None
+
+
+def analyze(run_dir: Path, mega_dir: Path, log=print) -> dict:
+    import pandas as pd
+    from . import core, cv_eval, mega
+    P, why = prepare(run_dir, mega_dir)
+    if P is None:
+        return {"status": "n/a", "why": why, "md": "(not enough data)\n", "statuses": []}
+    df, HA, HB, ly, srows, sly, bl, obs, orc, pre = (P[k] for k in ("df", "HA", "HB", "ly", "srows", "sly", "bl", "obs", "orc", "pre"))
     targets = ["flip", "prop", "flip_step"]
     Y = df[targets].values.astype(np.float64)
     nulls = [r["flip_null"] for r in srows if "flip_null" in r]

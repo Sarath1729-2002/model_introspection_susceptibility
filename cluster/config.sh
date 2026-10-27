@@ -85,3 +85,9 @@ export STEER_BIG_H="${STEER_BIG_H:-3}"          # budget of the large-dose steer
 export STEER_BIG_DOSES="${STEER_BIG_DOSES:-4,8,16,32}"   # |alpha| in probe-projection sds, applied as +/-
 export STEER_BIG_NRAND="${STEER_BIG_NRAND:-4}"
 export STEER_BIG_DIR="${STEER_BIG_DIR:-steer_big}"
+
+# ---- robust run (robustness of I[num]:flip + causal steering AT the injected token; needs mega/steps, mega/inject and mega/steer/dirs.npz; see docs/ROBUST.md) ----
+export ROBUST_DIR="${ROBUST_DIR:-robust}"          # sub-directory of $MEGA_DIR (the smoke run uses robust_smoke)
+export ROBUST_N="${ROBUST_N:-3000}"                # injected test rows steered per condition
+export ROBUST_STEER_H="${ROBUST_STEER_H:-3}"       # budget (hours) of the injection-steering job; conditions are priority-ordered, a cut-off leaves the most informative ones
+export ROBUST_MAX_NEW="${ROBUST_MAX_NEW:-384}"
