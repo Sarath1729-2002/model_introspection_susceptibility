@@ -18,7 +18,7 @@ MAX_NEW = {"gsm8k": 512, "math": 1024, "arc": 512, "arith": 512, "prog": 512}
 
 
 def run(problems, model, tok, out_dir: Path, shard=0, nshards=1, chunk=64, max_new=0, n_spread=4, temperature=0.7, top_p=0.95, max_seqs=96,
-        tag="", budget_s=0, sub="", log=print) -> int:
+        tag="", budget_s=0, sub="", log=print, con=True) -> int:
     d = Path(out_dir) / "gen"
     d.mkdir(parents=True, exist_ok=True)
     bud = Budget(budget_s)
@@ -32,7 +32,7 @@ def run(problems, model, tok, out_dir: Path, shard=0, nshards=1, chunk=64, max_n
             break
         mn = max_new or MAX_NEW.get(ds, 512)
         pl = generate_ids(model, tok, [chat_prompt(tok, plain_text(p)) for p in batch], mn, 1, 0.0, top_p, max_seqs)
-        co = generate_ids(model, tok, [chat_prompt(tok, con_text(p)) for p in batch], mn, 1, 0.0, top_p, max_seqs)
+        co = generate_ids(model, tok, [chat_prompt(tok, con_text(p)) for p in batch], mn, 1, 0.0, top_p, max_seqs) if con else [[([], False)] for _ in batch]       # con=False: no constrained run (matrix cells that only need plain solutions); placeholders keep the record schema
         sp = generate_ids(model, tok, [chat_prompt(tok, plain_text(p)) for p in batch], mn, n_spread, temperature, top_p, max_seqs) if n_spread else [[] for _ in batch]
         rows = []
         for p, (pi, pf), (ci, cf), ss in zip(batch, (x[0] for x in pl), (x[0] for x in co), sp):

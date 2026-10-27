@@ -91,3 +91,10 @@ export ROBUST_DIR="${ROBUST_DIR:-robust}"          # sub-directory of $MEGA_DIR 
 export ROBUST_N="${ROBUST_N:-3000}"                # injected test rows steered per condition
 export ROBUST_STEER_H="${ROBUST_STEER_H:-3}"       # budget (hours) of the injection-steering job; conditions are priority-ordered, a cut-off leaves the most informative ones
 export ROBUST_MAX_NEW="${ROBUST_MAX_NEW:-384}"
+
+# ---- paper matrix (cells = model x dataset; see docs/PAPER.md and cluster/matrix.sh) ----
+export STOCH_N="${STOCH_N:-1000}"                  # injected rows re-sampled for the sampling-noise ceiling
+export STOCH_NSAMP="${STOCH_NSAMP:-8}"
+export STOCH_H="${STOCH_H:-1.5}"
+export NATURAL_H="${NATURAL_H:-1.5}"
+export BASE_RUN_NAME="${BASE_RUN_NAME:-qwen7b-psuite}"   # run whose problems.jsonl every cell shares (identical problems across models)

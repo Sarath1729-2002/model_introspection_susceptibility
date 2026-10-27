@@ -17,11 +17,15 @@ source "$VENV/bin/activate"
 cd "$SLURM_SUBMIT_DIR"
 export PYTHONPATH="$SLURM_SUBMIT_DIR/src:${PYTHONPATH:-}"
 mkdir -p "$RUN_DIR"
-for f in problems.jsonl ground_truth_audit.json; do [[ -f "$RUN_DIR/$f" ]] || ln -sf "$ROOT/outputs/$RUN_NAME/$f" "$RUN_DIR/$f"; done
+for f in problems.jsonl ground_truth_audit.json; do [[ -f "$RUN_DIR/$f" ]] || ln -sf "$ROOT/outputs/${BASE_RUN_NAME:-$RUN_NAME}/$f" "$RUN_DIR/$f"; done
 T0=$SECONDS
 trap 'notify "FAILED: stage=${STAGE} (line $LINENO)" "$(tail -n 25 "${SLURM_SUBMIT_DIR}/${SLURM_JOB_NAME}-${SLURM_JOB_ID}.out" 2>/dev/null)"' ERR
 elapsed() { printf '%dh%02dm' $(((SECONDS - T0) / 3600)) $((((SECONDS - T0) % 3600) / 60)); }
 LIM=(); [[ -n "${GATE:-}" ]] && LIM=(--limit "$GATE_LIMIT")
+[[ -n "${CELL_LIMIT:-}" ]] && LIM=(--limit "$CELL_LIMIT")                       # matrix cells: first N problems per dataset (same value in every stage of the cell)
+CDS=(--ds "${CELL_DS:-gsm8k}")                                                # dataset of the matrix cell
+GXTRA=(); [[ -n "${CELL_NO_CON:-}" ]] && GXTRA+=(--no-con)
+SXTRA=(); [[ -n "${CELL_NO_DEL:-}" ]] && SXTRA+=(--no-del)
 DS=(); [[ -n "${DATASETS:-}" ]] && DS=(--datasets "$DATASETS")
 BUDGET_S="$(python3 -c "print(int(float('${GEN_BUDGET_H}')*3600))")"
 UNC_BUDGET_S="$(python3 -c "print(int(float('${UNC_BUDGET_H}')*3600))")"
@@ -42,12 +46,12 @@ run_sharded() {
 case "${STAGE:?set STAGE}" in
 states)
   notify "states STARTED"
-  run_sharded states --run-dir "$RUN_DIR" --model-id "$MODEL_ID" --fwd-bs "$FWD_BS" ${LIM[@]+"${LIM[@]}"} ${DS[@]+"${DS[@]}"}
+  run_sharded states --run-dir "$RUN_DIR" --model-id "$MODEL_ID" --fwd-bs "$FWD_BS" ${GXTRA[@]+"${GXTRA[@]}"} ${LIM[@]+"${LIM[@]}"} ${DS[@]+"${DS[@]}"}
   notify "states DONE in $(elapsed)" ;;
 gen)
   notify "gen STARTED" "greedy plain + constrained + ${N_SPREAD} sampled, budget ${GEN_BUDGET_H}h"
   [[ -n "${GATE:-}" ]] && BUDGET_S=0
-  run_sharded gen --run-dir "$RUN_DIR" --model-id "$MODEL_ID" --n-spread "$N_SPREAD" --chunk "$CHUNK" --max-seqs "$MAX_SEQS" --budget-s "$BUDGET_S" ${LIM[@]+"${LIM[@]}"} ${DS[@]+"${DS[@]}"}
+  run_sharded gen --run-dir "$RUN_DIR" --model-id "$MODEL_ID" --n-spread "$N_SPREAD" --chunk "$CHUNK" --max-seqs "$MAX_SEQS" --max-new "${GEN_MAX_NEW:-0}" --budget-s "$BUDGET_S" ${GXTRA[@]+"${GXTRA[@]}"} ${LIM[@]+"${LIM[@]}"} ${DS[@]+"${DS[@]}"}
   notify "gen DONE in $(elapsed)" "chunks: $(ls "$RUN_DIR"/gen/*.jsonl 2>/dev/null | wc -l)" ;;
 trace)
   notify "trace STARTED"
@@ -72,7 +76,7 @@ unc-analyze)
   notify "UNC REPORT ready" "$(sed -n '/## 0. DECISION/,/## 2. Label/p' "$RUN_DIR/unc_n${UNC_N}/analysis/UNC_REPORT.md" | cut -c1-400 | head -n 30)" ;;
 mega-steps)
   notify "mega-steps STARTED" "edit + regenerate numeric steps, budget ${MEGA_STEPS_H}h"
-  run_sharded steps --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --model-id "$MODEL_ID" --chunk "$MEGA_CHUNK" --max-steps "$MEGA_MAX_STEPS" --max-seqs "$MAX_SEQS" --budget-s "$(python3 -c "print(int(float('${MEGA_STEPS_H}')*3600))")"
+  run_sharded steps --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --model-id "$MODEL_ID" --chunk "$MEGA_CHUNK" --max-steps "$MEGA_MAX_STEPS" --max-seqs "$MAX_SEQS" --max-new "${STEPS_MAX_NEW:-0}" ${CDS[@]+"${CDS[@]}"} ${SXTRA[@]+"${SXTRA[@]}"} ${LIM[@]+"${LIM[@]}"} --budget-s "$(python3 -c "print(int(float('${MEGA_STEPS_H}')*3600))")"
   notify "mega-steps DONE in $(elapsed)" "chunks: $(ls "$MEGA_DIR"/steps/s*.jsonl 2>/dev/null | wc -l)" ;;
 mega-unc)
   notify "mega-unc STARTED" "${MEGA_UNC_N} unseen GSM8K problems x ${MEGA_N_ROLL} rollouts, budget ${MEGA_UNC_H}h"
@@ -87,7 +91,7 @@ mega-steer-run)
   notify "mega-steer-run DONE in $(elapsed)" "conditions: $(ls "$MEGA_DIR"/steer/r*.jsonl 2>/dev/null | wc -l)" ;;
 inject)
   notify "inject STARTED" "state at the injected number for every edited step, budget ${INJECT_H}h"
-  run_sharded inject --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --model-id "$MODEL_ID" --chunk "$INJECT_CHUNK" --budget-s "$(python3 -c "print(int(float('${INJECT_H}')*3600))")"
+  run_sharded inject --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --model-id "$MODEL_ID" --chunk "$INJECT_CHUNK" ${CDS[@]+"${CDS[@]}"} ${LIM[@]+"${LIM[@]}"} --budget-s "$(python3 -c "print(int(float('${INJECT_H}')*3600))")"
   notify "inject DONE in $(elapsed)" "chunks: $(ls "$MEGA_DIR"/inject/i*.jsonl 2>/dev/null | wc -l)" ;;
 steer-big)
   [[ -f "$MEGA_DIR/steer/dirs.npz" ]] || { notify "steer-big: no $MEGA_DIR/steer/dirs.npz (run MODE=mega first)"; exit 1; }
@@ -95,19 +99,33 @@ steer-big)
   run_sharded steer-run --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --model-id "$MODEL_ID" --max-seqs "$MAX_SEQS" --steer-n "$MEGA_STEER_N" --steer-alphas "$STEER_BIG_DOSES" --steer-nrand "$STEER_BIG_NRAND" --steer-out "$STEER_BIG_DIR" --budget-s "$(python3 -c "print(int(float('${STEER_BIG_H}')*3600))")"
   notify "steer-big DONE in $(elapsed)" "conditions: $(ls "$MEGA_DIR"/"$STEER_BIG_DIR"/r*.jsonl 2>/dev/null | wc -l)" ;;
 robust-prep)
-  CUDA_VISIBLE_DEVICES=0 python -m psuite.cli robust-prep --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --robust-dir "$ROBUST_DIR" --robust-n "$ROBUST_N"
+  CUDA_VISIBLE_DEVICES=0 python -m psuite.cli robust-prep --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --robust-dir "$ROBUST_DIR" --robust-n "$ROBUST_N" ${CDS[@]+"${CDS[@]}"}
   notify "robust-prep DONE in $(elapsed)" "$(cat "$MEGA_DIR/$ROBUST_DIR"/steer/prep.json 2>/dev/null | tr -d '\n' | cut -c1-400)" ;;
 robust-steer)
   [[ -f "$MEGA_DIR/$ROBUST_DIR/steer/dirs.npz" ]] || { notify "robust-steer: no $MEGA_DIR/$ROBUST_DIR/steer/dirs.npz (robust-prep failed?)"; exit 1; }
   notify "robust-steer STARTED" "steering at the injected token, ${ROBUST_N} rows/condition, budget ${ROBUST_STEER_H}h"
-  run_sharded robust-steer --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --robust-dir "$ROBUST_DIR" --model-id "$MODEL_ID" --max-seqs "$MAX_SEQS" --max-new "$ROBUST_MAX_NEW" --budget-s "$(python3 -c "print(int(float('${ROBUST_STEER_H}')*3600))")"
+  run_sharded robust-steer --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --robust-dir "$ROBUST_DIR" --model-id "$MODEL_ID" --max-seqs "$MAX_SEQS" --max-new "$ROBUST_MAX_NEW" ${CDS[@]+"${CDS[@]}"} ${LIM[@]+"${LIM[@]}"} --budget-s "$(python3 -c "print(int(float('${ROBUST_STEER_H}')*3600))")"
   notify "robust-steer DONE in $(elapsed)" "conditions: $(ls "$MEGA_DIR/$ROBUST_DIR"/steer/r*.jsonl 2>/dev/null | wc -l)" ;;
 robust-offline)
-  CUDA_VISIBLE_DEVICES=1 python -m psuite.cli robust-offline --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --robust-dir "$ROBUST_DIR"
+  CUDA_VISIBLE_DEVICES=1 python -m psuite.cli robust-offline --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --robust-dir "$ROBUST_DIR" ${CDS[@]+"${CDS[@]}"}
   notify "robust-offline DONE in $(elapsed)" ;;
 robust-analyze)
-  CUDA_VISIBLE_DEVICES=0 python -m psuite.cli robust-analyze --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --robust-dir "$ROBUST_DIR"
+  CUDA_VISIBLE_DEVICES=0 python -m psuite.cli robust-analyze --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --robust-dir "$ROBUST_DIR" ${CDS[@]+"${CDS[@]}"}
   notify "ROBUST REPORT ready" "$(sed -n '/## Verdict/,/## Offline checks/p' "$MEGA_DIR/$ROBUST_DIR/analysis/ROBUST_REPORT.md" | cut -c1-500 | head -n 30)" ;;
+stoch-run)
+  notify "stoch-run STARTED" "${STOCH_N} rows x ${STOCH_NSAMP} sampled continuations, budget ${STOCH_H}h"
+  run_sharded stoch-run --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --robust-dir "$ROBUST_DIR" --model-id "$MODEL_ID" --max-seqs "$MAX_SEQS" --max-new "${STEPS_MAX_NEW:-0}" --stoch-n "$STOCH_N" --n-samp "$STOCH_NSAMP" ${CDS[@]+"${CDS[@]}"} ${LIM[@]+"${LIM[@]}"} --budget-s "$(python3 -c "print(int(float('${STOCH_H}')*3600))")"
+  notify "stoch-run DONE in $(elapsed)" ;;
+natural-run)
+  notify "natural-run STARTED" "natural slips + corrected regenerations, budget ${NATURAL_H}h"
+  run_sharded natural-run --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --robust-dir "$ROBUST_DIR" --model-id "$MODEL_ID" --max-seqs "$MAX_SEQS" --max-new "${STEPS_MAX_NEW:-0}" ${CDS[@]+"${CDS[@]}"} ${LIM[@]+"${LIM[@]}"} --budget-s "$(python3 -c "print(int(float('${NATURAL_H}')*3600))")"
+  notify "natural-run DONE in $(elapsed)" ;;
+cell-analyze)
+  CUDA_VISIBLE_DEVICES=0 python -m psuite.cli cell-analyze --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --robust-dir "$ROBUST_DIR" ${CDS[@]+"${CDS[@]}"}
+  notify "cell-analyze DONE in $(elapsed)" "$RUN_NAME / ${CELL_DS:-gsm8k}" ;;
+paper)
+  python -m psuite.cli paper --run-dir "$RUN_DIR" --cells "$CELLS_JSON" --paper-out "$PAPER_OUT"
+  notify "PAPER REPORT ready" "$(sed -n '1,14p' "$PAPER_OUT/PAPER_REPORT.md" | cut -c1-400)" ;;
 inject-analyze)
   CUDA_VISIBLE_DEVICES=0 python -m psuite.cli inject-analyze --run-dir "$RUN_DIR" --mega-dir "$MEGA_DIR" --steer-out "$STEER_BIG_DIR"
   notify "INJECT REPORT ready" "$(sed -n '/## Verdict/,/## Error propagation/p' "$MEGA_DIR/inject/analysis/INJECT_REPORT.md" | cut -c1-500 | head -n 30)" ;;

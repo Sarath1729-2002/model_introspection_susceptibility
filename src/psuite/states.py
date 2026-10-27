@@ -8,7 +8,7 @@ from .prompts import chat_prompt, con_text, plain_text
 from .sched import Budget, schedule
 
 
-def run(problems, model, tok, out_dir: Path, shard=0, nshards=1, fwd_bs=8, chunk=128, tag="", budget_s=0, sub="", log=print) -> int:
+def run(problems, model, tok, out_dir: Path, shard=0, nshards=1, fwd_bs=8, chunk=128, tag="", budget_s=0, sub="", log=print, con=True) -> int:
     d = Path(out_dir) / "states"
     d.mkdir(parents=True, exist_ok=True)
     pad = pad_id(tok)
@@ -22,7 +22,7 @@ def run(problems, model, tok, out_dir: Path, shard=0, nshards=1, fwd_bs=8, chunk
             log("[states] time budget reached - stopping cleanly")
             break
         pack = {"ids": np.array([p["id"] for p in batch])}
-        for name, fn in (("plain", plain_text), ("con", con_text)):
+        for name, fn in (("plain", plain_text), ("con", con_text))[:2 if con else 1]:
             seqs = [enc(tok, chat_prompt(tok, fn(p))) for p in batch]
             order = sorted(range(len(seqs)), key=lambda i: len(seqs[i]))
             H = None

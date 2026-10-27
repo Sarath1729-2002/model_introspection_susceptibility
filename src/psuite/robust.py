@@ -197,11 +197,114 @@ def diagnostics(P, bl, B: int = 500, log=print) -> dict:
     return {"regimes": out, "strata": strata}
 
 
-def offline(run_dir: Path, mega_dir: Path, log=print, B: int = 500, name: str = "robust") -> dict:
+# ----------------------------------------------------------------------------- the 'How Much is Left?' evaluation vocabulary, applied to error propagation
+def regime_fit(P, bl, rg: str = "iid", y_col: str = "flip", seed: int = 0):
+    """one CV-selected probe fit and every OBSERVABLE baseline for a regime.  -> dict(pool, test, y, p (probe test pred), q (best observable test pred), best, layer, bp {name: pred}) or None."""
+    from . import cv_eval
+    from .core import r2
+    df, HA, ly = P["df"], P["HA"], P["ly"]
+    pool, test = cv_eval.split_indices(df.split.values, df.d1.values, rg)
+    if len(pool) < 60 or len(test) < 30:
+        return None
+    y = df[y_col].values.astype(np.float64)
+    Y, g = y[:, None], df.id.values
+    pr = cv_eval.cv_probe(lambda li: HA[:, li, :].astype(np.float32), list(range(len(ly))), Y, pool, test, g, 5, seed)[0]
+    bp = {n: cv_eval.cv_probe(lambda _l, F=F: F, [0], Y, pool, test, g, 5, seed)[0]["pred"] for n, F in bl.items() if "oracle" not in n}
+    b2 = {n: r2(y[test], v) for n, v in bp.items()}
+    best = max(b2, key=lambda n: -1e9 if np.isnan(b2[n]) else b2[n])
+    return {"pool": pool, "test": test, "y": y, "p": pr["pred"], "q": bp[best], "best": best, "layer": int(ly[pr["layer"]]), "bp": bp, "cv_r2": pr["cv_r2"]}
+
+
+def brier_skill(y, p, base) -> float:
+    p = np.clip(np.asarray(p, float), 0, 1)
+    y = np.asarray(y, float)
+    return float(1 - ((p - y) ** 2).mean() / ((base - y) ** 2).mean())
+
+
+def mae_ratio(y, p, med) -> float:
+    """MAE of p over MAE of the constant-median predictor (the paper's floor-normalised error; < 1 beats the floor)."""
+    y = np.asarray(y, float)
+    return float(np.abs(np.asarray(p, float) - y).mean() / np.abs(med - y).mean())
+
+
+def paper_metrics(P, bl, log=print, seeds=(0, 1, 2)) -> dict:
+    """the paper's evaluation vocabulary for the headline label:
+      floor            constant predictor (median of the pool label; base rate for Brier)
+      ladder           floor < position-only < surface text (+ hashed bag-of-words) < early layer < pre-edit state carried forward ('exact countdown' analogue) < injection-time probe
+      controls         shuffled labels (global; within problem) through the whole pipeline
+      seeds            CV fold seeds 0,1,2: mean +- sd of R2 / AUROC
+      prop             the continuous label log10(1+|final - original final|): MAE and MAE / constant-median MAE
+    -> {'ladder': [rows], 'controls': [...], 'seeds': [...], 'prop': [...]}"""
+    from . import cv_eval
+    from .core import r2
+    df, HA, ly, sly, pre = P["df"], P["HA"], P["ly"], P["sly"], P["pre"]
+    pl = [l for l in sly if l % 4 == 0 or l == sly[-1]]
+    g = df.id.values
+    out = {"ladder": [], "controls": [], "seeds": [], "prop": []}
+    for rg in ("iid", "shift"):
+        f = regime_fit(P, bl, rg)
+        if f is None:
+            continue
+        pool, test, y = f["pool"], f["test"], f["y"]
+        yt = y[test]
+        base = float(y[pool].mean())
+        med = float(np.median(y[pool]))
+        pre_r = cv_eval.cv_probe(lambda li: pre(pl[li]), list(range(len(pl))), y[:, None], pool, test, g)[0]["pred"]
+        rungs = [("floor: constant", np.full(len(test), base))] + [(n, f["bp"][k]) for n, k in (("position only", "Bpos"), ("surface text (+bag-of-words)", "Bbow+obs"), ("early layer (L8, post-injection)", "Hpost8(early-layer)"),
+                                                                                                     ("model's own surprise + edit", "Bsurprise")) if k in f["bp"]]
+        rungs += [("pre-edit state carried forward (countdown analogue)", pre_r), ("injection-time probe", f["p"])]
+        for name, pred in rungs:
+            out["ladder"].append({"regime": rg, "predictor": name, "auroc": auroc(yt, pred) if "floor" not in name else 0.5, "r2": float(r2(yt, pred)) if "floor" not in name else 0.0,
+                                  "brier_skill": brier_skill(yt, pred, base), "mae_over_floor": 1.0 if "floor" in name else mae_ratio(yt, np.clip(pred, 0, 1), med),
+                                  "tpr10": tpr_at_fpr(yt, pred) if "floor" not in name else 0.1, "n_test": int(len(test))})
+        log(f"  paper ladder {rg}: probe AUROC {out['ladder'][-1]['auroc']:.3f}")
+    # controls (iid): shuffled labels through the whole pipeline
+    pool, test = cv_eval.split_indices(df.split.values, df.d1.values, "iid")
+    y = df.flip.values.astype(np.float64)
+    real = cv_eval.cv_probe(lambda li: HA[:, li, :].astype(np.float32), list(range(len(ly))), y[:, None], pool, test, g)[0]
+    out["controls"].append({"control": "real labels", "seed": 0, "test_r2": float(r2(y[test], real["pred"])), "test_auroc": auroc(y[test], real["pred"])})
+    for kind in ("global", "within-problem"):
+        for s in seeds:
+            rng = np.random.RandomState(500 + s)
+            if kind == "global":
+                ys = rng.permutation(y)
+            else:
+                ys = y.copy()
+                for gi in np.unique(g):
+                    ix = np.where(g == gi)[0]
+                    ys[ix] = y[rng.permutation(ix)]
+            r = cv_eval.cv_probe(lambda li: HA[:, li, :].astype(np.float32), list(range(len(ly))), ys[:, None], pool, test, g)[0]
+            out["controls"].append({"control": f"shuffled labels ({kind})", "seed": s, "test_r2": float(r2(ys[test], r["pred"])), "test_r2_vs_real_labels": float(r2(y[test], r["pred"])), "test_auroc_vs_real_labels": auroc(y[test], r["pred"])})
+    # fold-seed stability
+    rs, au = [], []
+    for s in seeds:
+        f = regime_fit(P, bl, "iid", seed=s)
+        rs.append(float(r2(f["y"][f["test"]], f["p"])))
+        au.append(auroc(f["y"][f["test"]], f["p"]))
+    out["seeds"] = [{"metric": "test R2", "mean": float(np.mean(rs)), "sd": float(np.std(rs)), "values": rs}, {"metric": "test AUROC", "mean": float(np.mean(au)), "sd": float(np.std(au)), "values": au}]
+    # continuous propagation label, in the paper's units (MAE vs constant-median floor)
+    if "prop" in df:
+        for rg in ("iid", "shift"):
+            pool, test = cv_eval.split_indices(df.split.values, df.d1.values, rg)
+            yp = df.prop.values.astype(np.float64)
+            m = np.isfinite(yp)
+            pool, test = pool[m[pool]], test[m[test]]
+            if len(pool) < 60 or len(test) < 30:
+                continue
+            res = cv_eval.cv_probe(lambda li: HA[:, li, :].astype(np.float32), list(range(len(ly))), yp[:, None], pool, test, g)[0]
+            medv = float(np.median(yp[pool]))
+            bpr = cv_eval.cv_probe(lambda _l: P["obs"], [0], yp[:, None], pool, test, g)[0]["pred"]
+            out["prop"].append({"regime": rg, "n_test": int(len(test)), "floor_mae": float(np.abs(yp[test] - medv).mean()), "probe_mae": float(np.abs(yp[test] - res["pred"]).mean()),
+                                "probe_over_floor": float(np.abs(yp[test] - res["pred"]).mean() / np.abs(yp[test] - medv).mean()), "observables_mae": float(np.abs(yp[test] - bpr).mean()),
+                                "observables_over_floor": float(np.abs(yp[test] - bpr).mean() / np.abs(yp[test] - medv).mean()), "probe_r2": float(r2(yp[test], res["pred"]))})
+    return out
+
+
+def offline(run_dir: Path, mega_dir: Path, log=print, B: int = 500, name: str = "robust", ds: str = "gsm8k") -> dict:
     """everything that needs no generation.  Results are cached in <mega>/<name>/offline.json."""
     from . import mega
     from .inject import prepare
-    P, why = prepare(run_dir, mega_dir)
+    P, why = prepare(run_dir, mega_dir, ds)
     if P is None:
         return {"status": "n/a", "why": why}
     log(f"robust offline: {len(P['df'])} rows from {P['df'].id.nunique()} problems")
@@ -212,6 +315,8 @@ def offline(run_dir: Path, mega_dir: Path, log=print, B: int = 500, name: str = 
     log(f"  shuffled-label R2 by seed {res['shuffled']['r2_by_seed']}")
     res["curves"] = curves(P)
     res["diag"] = diagnostics(P, bl, B, log)
+    res["paper"] = paper_metrics(P, bl, log)
+    res["meta"] = {"ds": ds, "n_unfinished_excluded": int(P.get("n_unfinished", 0)), "n_rows_before_filter": int(P.get("n_rows_all", 0)), "base_flip_rate": float(P["df"].flip.mean()), "n_problems_by_split": P["df"].groupby("split").id.nunique().to_dict()}
     out = Path(mega_dir) / name
     out.mkdir(parents=True, exist_ok=True)
     (out / "offline.json").write_text(json.dumps(res, indent=1, default=float))
@@ -284,7 +389,7 @@ C8: steering SUPPORTED at >= 1 layer (slope CI > 0 over |alpha| <= 16 sd, > 2x t
 ROBUST + CAUSAL = C1-C8, ROBUST (diagnostic) = C1-C7, anything else FRAGILE (failed checks listed)."""
 
 
-def write_report(run_dir: Path, mega_dir: Path, log=print, B: int = 500, recompute: bool = False, name: str = "robust") -> Path:
+def write_report(run_dir: Path, mega_dir: Path, log=print, B: int = 500, recompute: bool = False, name: str = "robust", ds: str = "gsm8k") -> Path:
     import traceback
     import pandas as pd
     from . import core, istear, mega
@@ -297,7 +402,7 @@ def write_report(run_dir: Path, mega_dir: Path, log=print, B: int = 500, recompu
         off = json.loads(f.read_text())
     else:
         try:
-            off = offline(run_dir, mega_dir, log, B, name)
+            off = offline(run_dir, mega_dir, log, B, name, ds)
         except Exception:                                                                    # noqa: BLE001
             log(traceback.format_exc())
             off = {"status": "error", "why": traceback.format_exc()}

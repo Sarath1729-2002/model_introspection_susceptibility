@@ -86,7 +86,7 @@ def end_token_index(tok, ids: List[int], end_char: int) -> int:
     return min(max(lo, 1), len(ids))
 
 
-def run(problems, G, model, tok, out_dir: Path, shard=0, nshards=1, chunk=8, max_steps=8, max_new=512, max_seqs=96, budget_s=0, log=print) -> int:
+def run(problems, G, model, tok, out_dir: Path, shard=0, nshards=1, chunk=8, max_steps=8, max_new=512, max_seqs=96, budget_s=0, log=print, variants=("n1", "n2", "del")) -> int:
     import torch
     d = Path(out_dir)
     d.mkdir(parents=True, exist_ok=True)
@@ -126,8 +126,8 @@ def run(problems, G, model, tok, out_dir: Path, shard=0, nshards=1, chunk=8, max
                        "reuse": reuse_count(text, s), "ans_orig": g["plain_ans"]}
                 rows.append(row)
                 Hs.append(H)
-                variants = ["n1", "n2", "del"] + (["null"] if s["k"] == 0 else [])
-                for v in variants:
+                vs = list(variants) + (["null"] if s["k"] == 0 else [])
+                for v in vs:
                     pre = edited_prefix(text, s, "n1" if v == "null" else v)
                     if v == "null":
                         pre = text[:s["end"]] + "\n"
@@ -144,7 +144,8 @@ def run(problems, G, model, tok, out_dir: Path, shard=0, nshards=1, chunk=8, max
             rows[ri][f"flip_{v}"] = float(ans != rows[ri]["ans_orig"])
             rows[ri][f"fin_{v}"] = bool(fin)
         for r in rows:
-            r["load"] = float(np.mean([r["flip_n1"], r["flip_n2"], r["flip_del"]]))
+            if all(f"flip_{v}" in r for v in ("n1", "n2", "del")):
+                r["load"] = float(np.mean([r["flip_n1"], r["flip_n2"], r["flip_del"]]))
         np.savez(f.with_suffix(".npz"), H=np.stack(Hs), layers=np.array(layers))
         tmp = f.with_suffix(".tmp")
         with open(tmp, "w") as fh:

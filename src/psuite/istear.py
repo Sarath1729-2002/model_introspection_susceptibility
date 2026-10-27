@@ -74,6 +74,32 @@ class SteerLast:
             self.h.remove()
 
 
+def nll_under_model(model, tok, prompts, gens, bs=8):
+    """mean per-token NLL of each generated continuation under the UNSTEERED model (the paper's quality check: a steered text that the unsteered model finds very unlikely is degraded text)."""
+    import torch
+    from .hf_util import pad_id
+    dev = next(model.parameters()).device
+    seqs = [(enc(tok, p), list(g)) for p, g in zip(prompts, gens)]
+    out = [float("nan")] * len(seqs)
+    order = sorted(range(len(seqs)), key=lambda i: len(seqs[i][0]) + len(seqs[i][1]))
+    pad = pad_id(tok)
+    for s in range(0, len(order), bs):
+        idx = [i for i in order[s:s + bs] if len(seqs[i][1]) > 0]
+        if not idx:
+            continue
+        full = [seqs[i][0] + seqs[i][1] for i in idx]
+        W = max(len(x) for x in full)
+        ids = torch.tensor([x + [pad] * (W - len(x)) for x in full], device=dev)
+        att = torch.tensor([[1] * len(x) + [0] * (W - len(x)) for x in full], device=dev)
+        with torch.no_grad():
+            lp = torch.log_softmax(model(input_ids=ids, attention_mask=att).logits.float(), dim=-1)
+        for r, i in enumerate(idx):
+            a, n = len(seqs[i][0]), len(seqs[i][1])
+            tgt = ids[r, a:a + n]
+            out[i] = float(-lp[r, a - 1:a + n - 1].gather(1, tgt[:, None]).mean())
+    return out
+
+
 def select_rows(rows: List[dict], n: int, split: str = "test", splits: Dict[int, str] = None) -> List[dict]:
     """deterministic sample (crc32 of the row key) of at most n injected rows from problems of the given split."""
     cand = [r for r in rows if split is None or (splits or {}).get(r["id"]) == split]
@@ -81,13 +107,13 @@ def select_rows(rows: List[dict], n: int, split: str = "test", splits: Dict[int,
     return cand[:n] if n else cand
 
 
-def prep(run_dir: Path, mega_dir: Path, out_dir: Path, n_rows: int = 3000, log=print) -> dict:
+def prep(run_dir: Path, mega_dir: Path, out_dir: Path, n_rows: int = 3000, log=print, ds: str = "gsm8k") -> dict:
     from . import cv_eval, ridge
     from .core import r2
     from .inject import prepare
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    P, why = prepare(run_dir, mega_dir)
+    P, why = prepare(run_dir, mega_dir, ds)
     if P is None:
         raise RuntimeError(f"istear prep: {why}")
     df, HA, ly = P["df"], P["HA"], P["ly"]
@@ -149,7 +175,7 @@ def build_items(problems, G, inj_rows, rows_sel, tok):
     return items
 
 
-def run(problems, G, inj_rows, model, tok, out_dir: Path, shard=0, nshards=1, max_new=384, max_seqs=96, budget_s=0, log=print) -> int:
+def run(problems, G, inj_rows, model, tok, out_dir: Path, shard=0, nshards=1, max_new=384, max_seqs=96, budget_s=0, log=print, nll=True) -> int:
     out_dir = Path(out_dir)
     z = np.load(out_dir / "dirs.npz")
     layers = [int(x) for x in z["layers"]]
@@ -176,13 +202,15 @@ def run(problems, G, inj_rows, model, tok, out_dir: Path, shard=0, nshards=1, ma
         vec = None if fam is None else a * dirs[fam]
         with SteerLast(model, L or 1, vec):
             res = generate_ids(model, tok, prompts, max_new, 1, 0.0, 0.95, max_seqs)
+        want = nll and (fam is None or (abs(a) in HI and (fam.startswith("probe") or fam.startswith("rand0"))))
+        nl = nll_under_model(model, tok, prompts, [r[0][0] for r in res]) if want else [None] * len(items)
         tmp = f.with_suffix(".tmp")
         with open(tmp, "w") as fh:
-            for it, r in zip(items, res):
+            for it, r, nv in zip(items, res, nl):
                 ids, fin = r[0]
                 ans = parse_answer(it["cut"] + tok.decode(ids, skip_special_tokens=True), it["kind"])
                 fh.write(json.dumps({"id": it["id"], "k": it["k"], "var": it["var"], "cond": name, "ntok": len(ids), "fin": bool(fin), "ans": ans, "flip": float(ans != it["ans_orig"]),
-                                     "correct": float(ans == it["gold"])}) + "\n")
+                                     "correct": float(ans == it["gold"]), "nll": nv}) + "\n")
         tmp.rename(f)
         done += 1
         log(f"[istear shard {shard}] {name}: {len(items)} rows")
@@ -233,6 +261,19 @@ def analyze(out_dir: Path, B: int = 1000, seed: int = 0) -> dict:
         a = float(c.rsplit("_a", 1)[1]) if "_a" in c else 0.0
         rows.append({"cond": c, "family": fam, "alpha": a, "flip_rate": flip[c].mean(), "d_flip_vs_base": (flip[c] - flip["base"]).mean(), "acc": cor[c].mean(), "d_acc_vs_base": (cor[c] - cor["base"]).mean(),
                      "finished": fin[c].mean(), "d_finished_vs_base": (fin[c] - fin["base"]).mean(), "parsed": par[c].mean(), "d_parsed_vs_base": (par[c] - par["base"]).mean()})
+    nllv = {c: np.array([R[c][k].get("nll") if R[c][k].get("nll") is not None else np.nan for k in keys], dtype=float) for c in R}
+    for r in rows:
+        v = nllv[r["cond"]]
+        r["nll_unsteered"] = float(np.nanmean(v)) if np.isfinite(v).any() else float("nan")
+    rng0 = np.random.RandomState(seed + 1)
+    signs = rng0.choice([-1.0, 1.0], size=(2000, len(ug)))
+    for r in rows:
+        if r["cond"] == "base":
+            r["p_signflip"] = float("nan")
+            continue
+        per_prob = np.bincount(inv, weights=flip[r["cond"]] - flip["base"]) / cnt
+        obs = per_prob.mean()
+        r["p_signflip"] = float(((np.abs((signs * per_prob).mean(1)) >= abs(obs) - 1e-12).mean() * 2000 + 1) / 2001)
     tab = pd.DataFrame(rows)
     rng = np.random.RandomState(seed)
     boots = [rng.randint(0, len(ug), len(ug)) for _ in range(B)]
@@ -284,6 +325,7 @@ def analyze(out_dir: Path, B: int = 1000, seed: int = 0) -> dict:
             g = tab[tab.alpha == a]
             rr = g[g.family.str.startswith("rand") & g.family.str.endswith(f"_L{L}")]
             dose.append({"layer": L, "alpha": a, "probe_d_flip": float(g[g.family == f"probe_L{L}"].d_flip_vs_base.mean()), "diff_d_flip": float(g[g.family == f"diff_L{L}"].d_flip_vs_base.mean()),
-                         "rand_mean_abs_d_flip": float(rr.d_flip_vs_base.abs().mean()) if len(rr) else float("nan"), "probe_d_acc": float(g[g.family == f"probe_L{L}"].d_acc_vs_base.mean())})
+                         "rand_mean_abs_d_flip": float(rr.d_flip_vs_base.abs().mean()) if len(rr) else float("nan"), "probe_d_acc": float(g[g.family == f"probe_L{L}"].d_acc_vs_base.mean()),
+                         "probe_nll_unsteered": float(g[g.family == f"probe_L{L}"].nll_unsteered.mean()), "probe_p_signflip": float(g[g.family == f"probe_L{L}"].p_signflip.mean())})
     return {"status": layers[bl]["status"], "why": f"best layer L{bl}: {layers[bl]['why']}", "table": tab, "slopes": slopes, "layers": layers, "n": len(keys), "base_flip": float(flip["base"].mean()),
             "dose": pd.DataFrame(dose)}

@@ -147,7 +147,7 @@ def run(problems, G, srows, model, tok, out_dir: Path, shard=0, nshards=1, chunk
                     inj = span_stats(model, hs[-1][0], ids, len(pr) + fi, A)
                     rows.append({"id": p["id"], "k": r["k"], "var": v, "value": s["value"], "new_value": nv, "delta": nv - s["value"], "reuse": r["reuse"], "n_steps": r["n_steps"], "t_end": r["t_end"],
                                  "n_tok": r["n_tok"], "start": r["start"], "end": r["end"], "ans_orig": r["ans_orig"], "ans_var": r[f"ans_{v}"], "line": s["line"], "ptext": pre, "flip": float(r[f"flip_{v}"]),
-                                 "flip_step": float((r["flip_n1"] + r["flip_n2"]) / 2), "prop": propagation(r[f"ans_{v}"], r["ans_orig"]),
+                                 "flip_step": float((r["flip_n1"] + r["flip_n2"]) / 2), "fin": bool(r.get(f"fin_{v}", True)), "prop": propagation(r[f"ans_{v}"], r["ans_orig"]),
                                  **{f"inj_{a}": b for a, b in inj.items()}, **{f"orig_{a}": b for a, b in orig.items()}})
         if rows:
             np.savez(f.with_suffix(".npz"), HA=np.stack(HA), HB=np.stack(HB), layers=np.array(layers))
@@ -196,7 +196,7 @@ def feature_blocks(df, q_of):
     return pos, ed, stp, qf, pf, sp, orc
 
 
-def prepare(run_dir: Path, mega_dir: Path):
+def prepare(run_dir: Path, mega_dir: Path, ds: str = "gsm8k"):
     """-> (dict P, None) with the aligned frame, states and baseline feature blocks, or (None, reason) when there is not enough data."""
     import pandas as pd
     from . import mega
@@ -205,12 +205,17 @@ def prepare(run_dir: Path, mega_dir: Path):
     if HA is None or len(rows) < 400:
         return None, f"only {len(rows)} injected rows - the inject stage did not produce enough data"
     srows, Hs, slayers = mega.load_steps(Path(mega_dir) / "steps")
-    probs = {p["id"]: p for p in read_problems(run_dir, ["gsm8k"])}
+    probs = {p["id"]: p for p in read_problems(run_dir, [ds])}
     df = pd.DataFrame(rows)
     # natural (pre-edit) state of the same step from the steps thread: the competitor "the state already knew before the error was written"
     idx = {(r["id"], r["k"]): j for j, r in enumerate(srows)}
     j = np.array([idx.get((i, k), -1) for i, k in zip(df.id, df.k)])
     keep = j >= 0
+    if "fin" in df:                                                                  # continuation did not terminate within the budget: the final answer is unobserved (right-censored), excluded like the paper's naturally-terminated filter
+        keep &= df.fin.values.astype(bool)
+        n_unfin = int((~df.fin.values.astype(bool)).sum())
+    else:
+        n_unfin = 0
     if keep.sum() < 400:
         return None, f"only {int(keep.sum())} injected rows could be matched to a step-thread state"
     df, HA, HB, j = df[keep].reset_index(drop=True), HA[keep], HB[keep], j[keep]
@@ -228,13 +233,13 @@ def prepare(run_dir: Path, mega_dir: Path):
     for l in (8, 16):
         if l in sly:
             bl[f"Hpre{l}(natural-state)"] = pre(l)
-    return {"df": df, "HA": HA, "HB": HB, "ly": ly, "srows": srows, "Hs": Hs, "sly": sly, "j": j, "q": q, "bl": bl, "obs": obs, "orc": orc, "pre": pre}, None
+    return {"n_unfinished": n_unfin, "n_rows_all": int(len(rows)), "df": df, "HA": HA, "HB": HB, "ly": ly, "srows": srows, "Hs": Hs, "sly": sly, "j": j, "q": q, "bl": bl, "obs": obs, "orc": orc, "pre": pre}, None
 
 
-def analyze(run_dir: Path, mega_dir: Path, log=print) -> dict:
+def analyze(run_dir: Path, mega_dir: Path, log=print, ds: str = "gsm8k") -> dict:
     import pandas as pd
     from . import core, cv_eval, mega
-    P, why = prepare(run_dir, mega_dir)
+    P, why = prepare(run_dir, mega_dir, ds)
     if P is None:
         return {"status": "n/a", "why": why, "md": "(not enough data)\n", "statuses": []}
     df, HA, HB, ly, srows, sly, bl, obs, orc, pre = (P[k] for k in ("df", "HA", "HB", "ly", "srows", "sly", "bl", "obs", "orc", "pre"))

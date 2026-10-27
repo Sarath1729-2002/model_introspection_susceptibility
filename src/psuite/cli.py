@@ -20,7 +20,7 @@ def _write_meta(run: Path, a):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["data", "gen", "states", "trace", "analyze", "report", "unc-roll", "unc-analyze", "steps", "steer-prep", "steer-run", "mega-analyze", "inject", "inject-analyze", "robust-prep", "robust-steer", "robust-offline", "robust-analyze"])
+    ap.add_argument("cmd", choices=["data", "gen", "states", "trace", "analyze", "report", "unc-roll", "unc-analyze", "steps", "steer-prep", "steer-run", "mega-analyze", "inject", "inject-analyze", "robust-prep", "robust-steer", "robust-offline", "robust-analyze", "stoch-run", "natural-run", "cell-analyze", "paper"])
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--model-id", default="Qwen/Qwen2.5-7B-Instruct")
     ap.add_argument("--shard", type=int, default=0)
@@ -48,8 +48,15 @@ def main(argv=None):
     ap.add_argument("--steer-alphas", default="", help="steer-run: comma list of |alpha| doses (applied as +/-); default = the mega run's 1,2,4")
     ap.add_argument("--steer-out", default="steer", help="steer-run: sub-directory of the mega dir for the results (directions are always read from <mega>/steer)")
     ap.add_argument("--steer-nrand", type=int, default=8, help="steer-run: number of random control directions")
+    ap.add_argument("--ds", default="gsm8k", help="dataset of a matrix cell (steps / inject / robust-* / stoch / natural / lenref); gsm8k = the original cell")
+    ap.add_argument("--no-con", action="store_true", help="gen/states: skip the constrained prompt (matrix cells that only need plain solutions)")
+    ap.add_argument("--no-del", action="store_true", help="steps: do not run the line-deletion edit (saves a third of the regenerations)")
     ap.add_argument("--robust-dir", default="robust", help="robust-*: sub-directory of the mega dir (the smoke run uses robust_smoke); the steering results are in <robust-dir>/steer")
     ap.add_argument("--robust-n", type=int, default=3000, help="robust-prep: injected test rows to steer")
+    ap.add_argument("--stoch-n", type=int, default=1000, help="stoch-run: injected rows resampled")
+    ap.add_argument("--n-samp", type=int, default=8, help="stoch-run: sampled continuations per row")
+    ap.add_argument("--cells", default="", help="paper: JSON file with the list of cells [{name,model,ds,run_dir,mega_dir}]")
+    ap.add_argument("--paper-out", default="", help="paper: output directory")
     ap.add_argument("--parts", default="steps,unc,steer,suite", help="mega-analyze: threads to analyse")
     a = ap.parse_args(argv)
     run = Path(a.run_dir)
@@ -78,14 +85,23 @@ def main(argv=None):
         return
     if a.cmd == "robust-prep":
         from . import istear
-        istear.prep(run, mega, mega / a.robust_dir / "steer", a.robust_n)
+        istear.prep(run, mega, mega / a.robust_dir / "steer", a.robust_n, ds=a.ds)
         return
     if a.cmd in ("robust-offline", "robust-analyze"):
         from . import robust
         if a.cmd == "robust-offline":
-            robust.offline(run, mega, name=a.robust_dir)
+            robust.offline(run, mega, name=a.robust_dir, ds=a.ds)
         else:
-            robust.write_report(run, mega, name=a.robust_dir)
+            robust.write_report(run, mega, name=a.robust_dir, ds=a.ds)
+        return
+    if a.cmd == "cell-analyze":
+        from . import paper
+        paper.analyze_cell(run, mega, a.ds, name=a.robust_dir)
+        return
+    if a.cmd == "paper":
+        from . import paper
+        specs = json.loads(Path(a.cells).read_text())
+        paper.write(specs, Path(a.paper_out) if a.paper_out else Path(a.cells).parent / "paper")
         return
     if a.cmd == "steer-prep":
         from . import steer
@@ -117,11 +133,12 @@ def main(argv=None):
         unc.run(sub, G, model, tok, out_u, a.shard, a.nshards, n_roll=a.n_roll, n_cont=a.n_cont, cps=unc.CPS if a.n_cont else (), max_seqs=a.max_seqs, max_new=a.max_new, budget_s=a.budget_s)
     elif a.cmd == "steps":
         from . import steps, table
-        G = table.load_gen(run, ["gsm8k"])
-        steps.run([p for p in problems if p["ds"] == "gsm8k"], G, model, tok, mega / "steps", a.shard, a.nshards, chunk=a.chunk, max_steps=a.max_steps, max_new=a.max_new or 512, max_seqs=a.max_seqs, budget_s=a.budget_s)
+        G = table.load_gen(run, [a.ds])
+        steps.run([p for p in problems if p["ds"] == a.ds], G, model, tok, mega / "steps", a.shard, a.nshards, chunk=a.chunk, max_steps=a.max_steps, max_new=a.max_new or 512, max_seqs=a.max_seqs, budget_s=a.budget_s,
+                  variants=("n1", "n2") if a.no_del else ("n1", "n2", "del"))
     elif a.cmd == "steer-run":
         from . import steer
-        test = [p for p in problems if p["ds"] == "gsm8k" and p["split"] == "test"]
+        test = [p for p in problems if p["ds"] == a.ds and p["split"] == "test"]
         test = test[:a.steer_n] if a.steer_n else test
         kw = {}
         if a.steer_alphas:
@@ -131,22 +148,31 @@ def main(argv=None):
         steer.run(test, model, tok, mega / a.steer_out, a.shard, a.nshards, max_new=a.max_new or 512, max_seqs=a.max_seqs, budget_s=a.budget_s, dirs_dir=mega / "steer", n_rand=a.steer_nrand, **kw)
     elif a.cmd == "inject":
         from . import inject, table
-        G = table.load_gen(run, ["gsm8k"])
+        G = table.load_gen(run, [a.ds])
         sr = inject.step_rows(mega / "steps")
         if not sr:
             raise SystemExit(f"no step-thread outcomes in {mega / 'steps'}: run MODE=mega (steps) first")
-        inject.run([p for p in problems if p["ds"] == "gsm8k"], G, sr, model, tok, mega / "inject", a.shard, a.nshards, chunk=a.chunk, budget_s=a.budget_s)
+        inject.run([p for p in problems if p["ds"] == a.ds], G, sr, model, tok, mega / "inject", a.shard, a.nshards, chunk=a.chunk, budget_s=a.budget_s)
     elif a.cmd == "robust-steer":
         from . import inject, istear, table
-        G = table.load_gen(run, ["gsm8k"])
+        G = table.load_gen(run, [a.ds])
         irows = inject.load(mega / "inject")[0]
-        istear.run([p for p in problems if p["ds"] == "gsm8k"], G, irows, model, tok, mega / a.robust_dir / "steer", a.shard, a.nshards, max_new=a.max_new or 384, max_seqs=a.max_seqs, budget_s=a.budget_s)
+        istear.run([p for p in problems if p["ds"] == a.ds], G, irows, model, tok, mega / a.robust_dir / "steer", a.shard, a.nshards, max_new=a.max_new or 384, max_seqs=a.max_seqs, budget_s=a.budget_s)
+    elif a.cmd == "stoch-run":
+        from . import inject, stoch
+        irows = inject.load(mega / "inject")[0]
+        stoch.run([p for p in problems if p["ds"] == a.ds], irows, model, tok, mega / a.robust_dir / "stoch", a.shard, a.nshards, n_rows=a.stoch_n, n_samp=a.n_samp,
+                  max_new=a.max_new or 512, max_seqs=a.max_seqs, budget_s=a.budget_s)
+    elif a.cmd == "natural-run":
+        from . import natural, table
+        G = table.load_gen(run, [a.ds])
+        natural.run([p for p in problems if p["ds"] == a.ds], G, model, tok, mega / a.robust_dir / "natural", a.shard, a.nshards, max_new=a.max_new or 512, max_seqs=a.max_seqs, budget_s=a.budget_s)
     elif a.cmd == "gen":
         from . import gen
-        gen.run(problems, model, tok, run, a.shard, a.nshards, chunk=a.chunk, max_new=a.max_new, n_spread=a.n_spread, max_seqs=a.max_seqs, tag=a.tag, budget_s=a.budget_s, sub=a.sub)
+        gen.run(problems, model, tok, run, a.shard, a.nshards, chunk=a.chunk, max_new=a.max_new, n_spread=a.n_spread, max_seqs=a.max_seqs, tag=a.tag, budget_s=a.budget_s, sub=a.sub, con=not a.no_con)
     elif a.cmd == "states":
         from . import states
-        states.run(problems, model, tok, run, a.shard, a.nshards, fwd_bs=a.fwd_bs * 2, tag=a.tag, budget_s=a.budget_s, sub=a.sub)
+        states.run(problems, model, tok, run, a.shard, a.nshards, fwd_bs=a.fwd_bs * 2, tag=a.tag, budget_s=a.budget_s, sub=a.sub, con=not a.no_con)
     else:
         from . import trace
         trace.run(problems, model, tok, run, a.shard, a.nshards, fwd_bs=a.fwd_bs, chunk=a.chunk, tag=a.tag, budget_s=a.budget_s, sub=a.sub)

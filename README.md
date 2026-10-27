@@ -48,3 +48,7 @@ Error propagation at injection time (probe on the state at the last token of a n
 ## Robust run (after the inject run)
 `MODE=robust-smoke` then `MODE=robust bash cluster/submit.sh`: robustness checks C1-C7 of `I[num]:flip` (subsets, demeaned label, bag-of-words baselines, shuffled control, paired vs the pre-edit state, AUROC)
 plus a causal steering test at the injected token (C8). Pre-registration and decision rules: `docs/ROBUST.md`. Report: `$MEGA_DIR/robust/analysis/ROBUST_REPORT.md`.
+
+
+## Paper matrix (model x dataset) - see docs/PAPER.md
+`cluster/matrix.sh` runs the cells (Qwen2.5-7B and DeepSeek-R1-Distill-Qwen-7B x GSM8K and MATH), adds the sampling-noise ceiling (`stoch`), the natural-slip test (`natural`), the prompt-end length reference (`lenref`) and the transfer matrix (`matrix`), and `psuite.paper` assembles `PAPER_REPORT.md`. `docs/INTERIM_REPORT.md` holds the finished Qwen/GSM8K cell.
